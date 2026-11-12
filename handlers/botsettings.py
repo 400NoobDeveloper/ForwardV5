@@ -8,6 +8,7 @@
 #   Set Variables→ Sudo / Back
 #   Maintenance  → True / False toggle screen
 #   Log Channel SET prompt → Add Me To Group / Back
+#                            (once the bot is added: Verify / Back)
 #
 # Values are saved in data/settings.json.
 # ============================================================
@@ -18,7 +19,7 @@ import os
 from contextlib import suppress
 
 from pyrogram import Client, filters
-from pyrogram.enums import ParseMode
+from pyrogram.enums import ChatMemberStatus, ParseMode
 from pyrogram.errors import MessageNotModified
 from pyrogram.types import (
     CallbackQuery,
@@ -252,12 +253,23 @@ def _prompt_text(key: str) -> str:
 async def _prompt_kb(client: Client, key: str) -> InlineKeyboardMarkup:
     rows = []
     if key == "log_channel":
-        me = getattr(client, "me", None) or await client.get_me()
-        rows.append([InlineKeyboardButton(
-            _sc("Add Me To Group"), url=f"https://t.me/{me.username}?startgroup=true"
-        )])
+        if isinstance(_get("group"), dict):          # bot already added -> Verify
+            rows.append([_btn("Verify", "bset:gverify")])
+        else:
+            me = getattr(client, "me", None) or await client.get_me()
+            rows.append([InlineKeyboardButton(
+                _sc("Add Me To Group"), url=f"https://t.me/{me.username}?startgroup=true"
+            )])
     rows.append([_btn("Back", _back_target(key))])
     return InlineKeyboardMarkup(rows)
+
+
+async def _bot_in_group(client: Client, chat_id: int) -> bool:
+    try:
+        member = await client.get_chat_member(chat_id, "me")
+    except Exception:
+        return False
+    return member.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
 
 
 def _maint_text() -> str:
@@ -329,7 +341,7 @@ async def cb_botsettings(client: Client, query: CallbackQuery):
         return await query.answer()
 
     # any navigation cancels a pending "send the value" prompt
-    if action != "set":
+    if action not in ("set", "gverify"):
         _awaiting_input.pop(uid, None)
 
     if action == "main":
@@ -357,6 +369,17 @@ async def cb_botsettings(client: Client, query: CallbackQuery):
 
     elif action == "maint":
         await _show(query, _maint_text(), _maint_kb())
+
+    elif action == "gverify":
+        grp = _get("group")
+        if not isinstance(grp, dict) or not await _bot_in_group(client, grp["id"]):
+            _reset("group")
+            await _show(query, _prompt_text("log_channel"), await _prompt_kb(client, "log_channel"))
+            return await query.answer(
+                "Bot is not in a group. Tap Add Me To Group and add it again.",
+                show_alert=True,
+            )
+        toast = "Verified."                                   # top toast
 
     elif action == "setbool":
         _set("maintenance", parts[2] == "1")
@@ -426,3 +449,22 @@ async def handle_botsettings_value_input(client: Client, message: Message):
             reply_markup=_detail_kb(key), parse_mode=ParseMode.DISABLED,
         )
 
+
+@Client.on_message(filters.new_chat_members & filters.group, group=49)
+async def record_group_add(client: Client, message: Message):
+    """Owner added the bot to a group: remember it and swap the open
+    'Add Me To Group' button for 'Verify'."""
+    if not any(u.is_self for u in message.new_chat_members):
+        return
+    if not message.from_user or not _is_owner(message.from_user.id):
+        return
+    _set("group", {"id": message.chat.id, "title": message.chat.title or ""})
+    pending = _awaiting_input.get(message.from_user.id)
+    if pending and pending[0] == "log_channel":
+        _, chat_id, msg_id = pending
+        with suppress(Exception):
+            await client.edit_message_text(
+                chat_id, msg_id, _prompt_text("log_channel"),
+                reply_markup=await _prompt_kb(client, "log_channel"),
+                parse_mode=ParseMode.DISABLED,
+            )
