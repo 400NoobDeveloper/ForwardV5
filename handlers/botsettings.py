@@ -8,7 +8,8 @@
 #   Set Variables→ Sudo / Back
 #   Maintenance  → True / False toggle screen
 #   Log Channel SET prompt → Add Me To Group / Back
-#                            (once the bot is added: Verify / Back)
+#                            (once the bot is added: Verify / Back;
+#                             Verify saves that group as LOG_CHANNEL)
 #
 # Values are saved in data/settings.json.
 # ============================================================
@@ -379,6 +380,11 @@ async def cb_botsettings(client: Client, query: CallbackQuery):
                 "Bot is not in a group. Tap Add Me To Group and add it again.",
                 show_alert=True,
             )
+        # verified -> the group becomes the Log Channel
+        _set("log_channel", grp["id"])
+        _reset("group")
+        _awaiting_input.pop(uid, None)
+        await _show(query, _detail_text("log_channel"), _detail_kb("log_channel"))
         toast = "Verified."                                   # top toast
 
     elif action == "setbool":
