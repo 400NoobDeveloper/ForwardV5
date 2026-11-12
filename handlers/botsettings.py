@@ -55,6 +55,13 @@ _SETTINGS_FILE = os.path.join(_DATA_DIR, "settings.json")
 # user_id -> (setting key, chat_id, message_id of the prompt being answered)
 _awaiting_input: dict = {}
 
+# Shared with handlers/settings.py (Auto-Sort Channels):
+#   ADDED_GROUPS[user_id]  -> group the user just added this bot to (waiting for Verify)
+#   GROUP_PROMPTS[user_id] -> async fn(client) that swaps an open prompt's
+#                             'Add Me To Group' button for 'Verify'
+ADDED_GROUPS: dict = {}
+GROUP_PROMPTS: dict = {}
+
 
 def _load() -> dict:
     try:
@@ -253,10 +260,10 @@ def _prompt_text(key: str) -> str:
     )
 
 
-async def _prompt_kb(client: Client, key: str) -> InlineKeyboardMarkup:
+async def _prompt_kb(client: Client, key: str, uid: int) -> InlineKeyboardMarkup:
     rows = []
     if key in GROUP_KEYS:
-        if isinstance(_get("group"), dict):          # bot already added -> Verify
+        if uid in ADDED_GROUPS:                      # bot already added -> Verify
             rows.append([_btn("Verify", f"bset:gverify:{key}")])
         else:
             me = getattr(client, "me", None) or await client.get_me()
@@ -362,7 +369,7 @@ async def cb_botsettings(client: Client, query: CallbackQuery):
     elif action == "set" and parts[2] in _VARS:
         key = parts[2]
         _awaiting_input[uid] = (key, query.message.chat.id, query.message.id)
-        await _show(query, _prompt_text(key), await _prompt_kb(client, key))
+        await _show(query, _prompt_text(key), await _prompt_kb(client, key, uid))
 
     elif action == "reset" and parts[2] in _VARS:
         key = parts[2]
@@ -375,17 +382,17 @@ async def cb_botsettings(client: Client, query: CallbackQuery):
 
     elif action == "gverify":
         key = parts[2] if len(parts) > 2 and parts[2] in GROUP_KEYS else "log_channel"
-        grp = _get("group")
-        if not isinstance(grp, dict) or not await _bot_in_group(client, grp["id"]):
-            _reset("group")
-            await _show(query, _prompt_text(key), await _prompt_kb(client, key))
+        grp = ADDED_GROUPS.get(uid)
+        if not grp or not await _bot_in_group(client, grp["id"]):
+            ADDED_GROUPS.pop(uid, None)
+            await _show(query, _prompt_text(key), await _prompt_kb(client, key, uid))
             return await query.answer(
                 "Bot is not in a group. Tap Add Me To Group and add it again.",
                 show_alert=True,
             )
         # verified -> the group becomes this variable's value
         _set(key, grp["id"])
-        _reset("group")
+        ADDED_GROUPS.pop(uid, None)
         _awaiting_input.pop(uid, None)
         await _show(query, _detail_text(key), _detail_kb(key))
         toast = "Verified."                                   # top toast
@@ -461,19 +468,30 @@ async def handle_botsettings_value_input(client: Client, message: Message):
 
 @Client.on_message(filters.new_chat_members & filters.group, group=49)
 async def record_group_add(client: Client, message: Message):
-    """Owner added the bot to a group: remember it and swap the open
-    'Add Me To Group' button for 'Verify'."""
+    """The bot was added to a group: remember it for that user and swap the
+    open 'Add Me To Group' button for 'Verify' (this panel or Auto-Sort Channels)."""
     if not any(u.is_self for u in message.new_chat_members):
         return
-    if not message.from_user or not _is_owner(message.from_user.id):
+    adder = message.from_user
+    if not adder:
         return
-    _set("group", {"id": message.chat.id, "title": message.chat.title or ""})
-    pending = _awaiting_input.get(message.from_user.id)
+    uid = adder.id
+    if not (_is_owner(uid) or uid in GROUP_PROMPTS):
+        return
+    ADDED_GROUPS[uid] = {"id": message.chat.id, "title": message.chat.title or ""}
+
+    refresh = GROUP_PROMPTS.get(uid)                 # Auto-Sort Channels prompt is open
+    if refresh:
+        with suppress(Exception):
+            await refresh(client)
+        return
+
+    pending = _awaiting_input.get(uid)               # /botsettings prompt is open
     if pending and pending[0] in GROUP_KEYS:
         key, chat_id, msg_id = pending
         with suppress(Exception):
             await client.edit_message_text(
                 chat_id, msg_id, _prompt_text(key),
-                reply_markup=await _prompt_kb(client, key),
+                reply_markup=await _prompt_kb(client, key, uid),
                 parse_mode=ParseMode.DISABLED,
             )

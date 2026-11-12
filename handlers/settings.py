@@ -11,6 +11,12 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardB
 from pyrogram.errors.exceptions.not_acceptable_406 import ChannelPrivate as PrivateChat
 from plugins.utils import STS
 from core.database import db
+from handlers import botsettings as _bs          # shared Add Me To Group state
+try:
+    from pyromod.listen.listen import ListenerCanceled
+except Exception:                                 # pyromod missing: never raised
+    class ListenerCanceled(Exception):
+        pass
 from plugins.controls import (
     AUTOSORT_CATEGORIES,
     CANCEL_BTN,
@@ -327,10 +333,22 @@ async def settings(client, message):
 
 
     
+async def _autosort_prompt_markup(bot, user_id, category):
+  """Auto-Sort 'SET' prompt buttons: Add Me To Group (-> Verify once the bot was added) + Back."""
+  if user_id in _bs.ADDED_GROUPS:
+     first = InlineKeyboardButton('ᴠᴇʀɪꜰʏ', callback_data=f"settings#verifyautosort_{category}")
+  else:
+     me = getattr(bot, "me", None) or await bot.get_me()
+     first = InlineKeyboardButton('ᴀᴅᴅ ᴍᴇ ᴛᴏ ɢʀᴏᴜᴘ', url=f"https://t.me/{me.username}?startgroup=true")
+  return InlineKeyboardMarkup([[first], [InlineKeyboardButton('ʙᴀᴄᴋ', callback_data=f"settings#editautosort_{category}")]])
+
+
 @Client.on_callback_query(filters.regex(r'^settings'))
 async def settings_query(bot, query):
   user_id = query.from_user.id
   i, type = query.data.split("#")
+  if not type.startswith("verifyautosort"):
+     _bs.GROUP_PROMPTS.pop(user_id, None)      # leaving the Auto-Sort prompt screen
   buttons = [[InlineKeyboardButton('ʙᴀᴄᴋ', callback_data="settings#main")]]
   
   if type=="main":
@@ -426,14 +444,23 @@ async def settings_query(bot, query):
      label = dict(AUTOSORT_CATEGORIES).get(category, category)
      back_buttons = [[InlineKeyboardButton('ʙᴀᴄᴋ', callback_data=f"settings#editautosort_{category}")]]
      await query.message.delete()
+     _bs.ADDED_GROUPS.pop(user_id, None)         # fresh prompt: start from Add Me To Group
+     show_verify = None
      try:
          text = await bot.send_message(
             user_id,
             f"<b>❪ SET {label.upper()} ❫</b>\n\n"
             "<b>Forward a message from the target channel, or send its numeric ID "
             "(e.g. <code>-1001234567890</code>).</b>\n"
-            "/cancel - cancel this process"
+            "/cancel - cancel this process",
+            reply_markup=await _autosort_prompt_markup(bot, user_id, category)
          )
+
+         async def show_verify(client, _m=text, _c=category, _u=user_id):
+            # bot was added to a group -> swap Add Me To Group for Verify
+            await client.edit_message_reply_markup(
+               _m.chat.id, _m.id, await _autosort_prompt_markup(client, _u, _c))
+         _bs.GROUP_PROMPTS[user_id] = show_verify
          reply = await bot.listen(chat_id=user_id, timeout=300)
          if reply.text == "/cancel":
             await reply.delete()
@@ -452,6 +479,32 @@ async def settings_query(bot, query):
          await text.edit_text("<b>Successfully updated</b>", reply_markup=InlineKeyboardMarkup(back_buttons))
      except asyncio.exceptions.TimeoutError:
          await text.edit_text('Process has been automatically cancelled', reply_markup=InlineKeyboardMarkup(back_buttons))
+     except ListenerCanceled:                     # Verify already saved the channel
+         return
+     finally:
+         if show_verify and _bs.GROUP_PROMPTS.get(user_id) is show_verify:
+            _bs.GROUP_PROMPTS.pop(user_id, None)
+
+  elif type.startswith("verifyautosort"):
+     category = type.split('_', 1)[1]
+     if category not in dict(AUTOSORT_CATEGORIES):
+        return await query.answer()
+     grp = _bs.ADDED_GROUPS.get(user_id)
+     if not grp or not await _bs._bot_in_group(bot, grp["id"]):
+        _bs.ADDED_GROUPS.pop(user_id, None)
+        try:
+           await query.message.edit_reply_markup(await _autosort_prompt_markup(bot, user_id, category))
+        except MessageNotModified:
+           pass
+        return await query.answer("Bot is not in a group. Tap Add Me To Group and add it again.", show_alert=True)
+     await db.set_category_channel(user_id, category, grp["id"])      # verified -> group becomes the channel
+     _bs.ADDED_GROUPS.pop(user_id, None)
+     _bs.GROUP_PROMPTS.pop(user_id, None)
+     bot.cancel_listener(user_id)                 # stop the "send the channel" listener
+     await query.message.edit_text(
+        "<b>Successfully updated</b>",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('ʙᴀᴄᴋ', callback_data=f"settings#editautosort_{category}")]]))
+     return await query.answer("Verified.")        # top toast
 
   elif type.startswith("resetautosort"):
      category = type.split('_', 1)[1]
