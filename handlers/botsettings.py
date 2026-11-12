@@ -7,9 +7,9 @@
 #   SET          → "send the channel ID or @username" prompt (BACK)
 #   Set Variables→ Sudo / Back
 #   Maintenance  → True / False toggle screen
-#   Log Channel SET prompt → Add Me To Group / Back
+#   Log Channel / News Channel SET prompt → Add Me To Group / Back
 #                            (once the bot is added: Verify / Back;
-#                             Verify saves that group as LOG_CHANNEL)
+#                             Verify saves that group as the value)
 #
 # Values are saved in data/settings.json.
 # ============================================================
@@ -140,6 +140,8 @@ _VARS = {
 }
 
 CHANNEL_KEYS = ("log_channel", "force_sub", "news_channel")
+# prompts that offer Add Me To Group -> Verify
+GROUP_KEYS = ("log_channel", "news_channel")
 
 
 def _back_target(key: str) -> str:
@@ -253,9 +255,9 @@ def _prompt_text(key: str) -> str:
 
 async def _prompt_kb(client: Client, key: str) -> InlineKeyboardMarkup:
     rows = []
-    if key == "log_channel":
+    if key in GROUP_KEYS:
         if isinstance(_get("group"), dict):          # bot already added -> Verify
-            rows.append([_btn("Verify", "bset:gverify")])
+            rows.append([_btn("Verify", f"bset:gverify:{key}")])
         else:
             me = getattr(client, "me", None) or await client.get_me()
             rows.append([InlineKeyboardButton(
@@ -372,19 +374,20 @@ async def cb_botsettings(client: Client, query: CallbackQuery):
         await _show(query, _maint_text(), _maint_kb())
 
     elif action == "gverify":
+        key = parts[2] if len(parts) > 2 and parts[2] in GROUP_KEYS else "log_channel"
         grp = _get("group")
         if not isinstance(grp, dict) or not await _bot_in_group(client, grp["id"]):
             _reset("group")
-            await _show(query, _prompt_text("log_channel"), await _prompt_kb(client, "log_channel"))
+            await _show(query, _prompt_text(key), await _prompt_kb(client, key))
             return await query.answer(
                 "Bot is not in a group. Tap Add Me To Group and add it again.",
                 show_alert=True,
             )
-        # verified -> the group becomes the Log Channel
-        _set("log_channel", grp["id"])
+        # verified -> the group becomes this variable's value
+        _set(key, grp["id"])
         _reset("group")
         _awaiting_input.pop(uid, None)
-        await _show(query, _detail_text("log_channel"), _detail_kb("log_channel"))
+        await _show(query, _detail_text(key), _detail_kb(key))
         toast = "Verified."                                   # top toast
 
     elif action == "setbool":
@@ -466,11 +469,11 @@ async def record_group_add(client: Client, message: Message):
         return
     _set("group", {"id": message.chat.id, "title": message.chat.title or ""})
     pending = _awaiting_input.get(message.from_user.id)
-    if pending and pending[0] == "log_channel":
-        _, chat_id, msg_id = pending
+    if pending and pending[0] in GROUP_KEYS:
+        key, chat_id, msg_id = pending
         with suppress(Exception):
             await client.edit_message_text(
-                chat_id, msg_id, _prompt_text("log_channel"),
-                reply_markup=await _prompt_kb(client, "log_channel"),
+                chat_id, msg_id, _prompt_text(key),
+                reply_markup=await _prompt_kb(client, key),
                 parse_mode=ParseMode.DISABLED,
             )
