@@ -2,17 +2,63 @@
 # Forward V2 - Start command handler
 # ============================================================
 
+import html
+import json
+import os
+
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from core.database import db
 
-# TODO: replace with your own updates/news channel link
-NEWS_CHANNEL = "https://t.me/dev_gagan"
+# Used until a News Channel is set in /botsettings
+DEFAULT_NEWS_CHANNEL = "https://t.me/dev_gagan"
+
+_SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "settings.json")
+_news_link_cache = {}          # saved value -> resolved link (only successful lookups)
 
 # Only one button here, as requested — Settings.
 main_buttons = [[
     InlineKeyboardButton('sᴇᴛᴛɪɴɢs', callback_data='settings#main')
 ]]
+
+
+async def _news_channel_url(client: Client) -> str:
+    """Link for the News Channel saved in /botsettings (default if none)."""
+    try:
+        with open(_SETTINGS_FILE, encoding="utf-8") as f:
+            value = json.load(f).get("news_channel")
+    except Exception:
+        value = None
+    if value in (None, ""):
+        return DEFAULT_NEWS_CHANNEL
+
+    value = str(value).strip()
+    if value in _news_link_cache:
+        return _news_link_cache[value]
+
+    link = None
+    if value.lstrip("-").isdigit():                 # numeric chat ID (e.g. from Verify)
+        try:
+            chat = await client.get_chat(int(value))
+            if chat.username:
+                link = f"https://t.me/{chat.username}"
+            elif chat.invite_link:
+                link = chat.invite_link
+        except Exception:
+            link = None
+    elif value.startswith("@"):
+        link = f"https://t.me/{value[1:]}"
+    elif value.startswith(("http://", "https://")):
+        link = value
+    elif value.startswith(("t.me/", "telegram.me/")):
+        link = f"https://{value}"
+    else:
+        link = f"https://t.me/{value}"
+
+    if not link:                                    # private chat with no usable link
+        return DEFAULT_NEWS_CHANNEL
+    _news_link_cache[value] = link
+    return link
 
 
 async def _get_bot_name(client: Client) -> str:
@@ -26,10 +72,11 @@ async def _get_bot_name(client: Client) -> str:
 
 async def _build_start_text(client: Client) -> str:
     bot_name = await _get_bot_name(client)
+    news_url = html.escape(await _news_channel_url(client), quote=True)
     return (
         f"Hey there! My name is <b>{bot_name}</b> - I'm a <b>powerful</b> auto forward bot! "
         "Use /help to find out how to use me to my full potential.\n\n"
-        f"Join my <a href=\"{NEWS_CHANNEL}\">news channel</a> to get information on all the latest updates.\n\n"
+        f"Join my <a href=\"{news_url}\">news channel</a> to get information on all the latest updates.\n\n"
         "Check /privacy to view the privacy policy, and interact with your data."
     )
 
