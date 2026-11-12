@@ -7,7 +7,7 @@
 #   SET          → "send the channel ID or @username" prompt (BACK)
 #   Set Variables→ Sudo / Back
 #   Maintenance  → True / False toggle screen
-#   Add Me To Group → Verify / Add To Group / Back  (Set Channel list)
+#   Add Me To Group → Verify / Add To Group / Back  (main panel)
 #
 # Values are saved in data/settings.json.
 # ============================================================
@@ -177,6 +177,7 @@ def _main_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [_btn("Set Channel", "bset:setch")],
         [_btn("Set Variables", "bset:setvar")],
+        [_btn(f"Add Me To Group: {'ADDED' if _get('group') else 'NOT ADDED'}", "bset:group")],
         [_btn(f"Maintenance: {_on_off(bool(_get('maintenance', False)))}", "bset:maint")],
         [_btn("Close", "bset:close")],
     ])
@@ -185,8 +186,8 @@ def _main_kb() -> InlineKeyboardMarkup:
 def _setch_text() -> str:
     return (
         "Variable: SET_CHANNEL\n\n"
-        "Description: Manage the log channel, force sub channel, news "
-        "channel and group used by this bot.\n\n"
+        "Description: Manage the log channel, force sub channel and news "
+        "channel used by this bot.\n\n"
         "Choose the channel you want to set."
     )
 
@@ -197,7 +198,6 @@ def _setch_kb() -> InlineKeyboardMarkup:
         [_btn(f"Log Channel: {_set_or_not('log_channel')}", "bset:view:log_channel")],
         [_btn(f"Force Sub: {_set_or_not('force_sub')}", "bset:view:force_sub")],
         [_btn(f"News Channel: {news}", "bset:view:news_channel")],
-        [_btn(f"Add Me To Group: {'ADDED' if _get('group') else 'NOT ADDED'}", "bset:group")],
         [_btn("Back", "bset:main")],
     ])
 
@@ -288,7 +288,7 @@ async def _group_kb(client: Client) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [_btn("Verify", "bset:gverify")],
         [InlineKeyboardButton(_sc("Add To Group"), url=f"https://t.me/{me.username}?startgroup=true")],
-        [_btn("Back", "bset:setch")],
+        [_btn("Back", "bset:main")],
     ])
 
 
