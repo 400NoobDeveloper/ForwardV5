@@ -7,7 +7,7 @@
 #   SET          → "send the channel ID or @username" prompt (BACK)
 #   Set Variables→ Sudo / Back
 #   Maintenance  → True / False toggle screen
-#   Add Me To Group → Verify / Add To Group / Back  (main panel)
+#   Log Channel SET prompt → Add Me To Group / Back
 #
 # Values are saved in data/settings.json.
 # ============================================================
@@ -18,7 +18,7 @@ import os
 from contextlib import suppress
 
 from pyrogram import Client, filters
-from pyrogram.enums import ChatMemberStatus, ParseMode
+from pyrogram.enums import ParseMode
 from pyrogram.errors import MessageNotModified
 from pyrogram.types import (
     CallbackQuery,
@@ -177,7 +177,6 @@ def _main_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [_btn("Set Channel", "bset:setch")],
         [_btn("Set Variables", "bset:setvar")],
-        [_btn(f"Add Me To Group: {'ADDED' if _get('group') else 'NOT ADDED'}", "bset:group")],
         [_btn(f"Maintenance: {_on_off(bool(_get('maintenance', False)))}", "bset:maint")],
         [_btn("Close", "bset:close")],
     ])
@@ -250,8 +249,15 @@ def _prompt_text(key: str) -> str:
     )
 
 
-def _prompt_kb(key: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[_btn("Back", _back_target(key))]])
+async def _prompt_kb(client: Client, key: str) -> InlineKeyboardMarkup:
+    rows = []
+    if key == "log_channel":
+        me = getattr(client, "me", None) or await client.get_me()
+        rows.append([InlineKeyboardButton(
+            _sc("Add Me To Group"), url=f"https://t.me/{me.username}?startgroup=true"
+        )])
+    rows.append([_btn("Back", _back_target(key))])
+    return InlineKeyboardMarkup(rows)
 
 
 def _maint_text() -> str:
@@ -269,35 +275,6 @@ def _maint_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(str(turn_on), callback_data=f"bset:setbool:{int(turn_on)}")],
         [InlineKeyboardButton("Back", callback_data="bset:main")],
     ])
-
-
-def _group_text() -> str:
-    grp = _get("group")
-    value = f"{grp.get('title') or 'group'} ({grp['id']})" if isinstance(grp, dict) else "not set"
-    return (
-        "Variable: ADD_ME_TO_GROUP\n\n"
-        "Description: Add this bot to your group, then tap Verify to confirm it.\n\n"
-        f"Current Value: {value}\n\n"
-        "Tap Add To Group, pick your group,\n"
-        "then tap Verify."
-    )
-
-
-async def _group_kb(client: Client) -> InlineKeyboardMarkup:
-    me = getattr(client, "me", None) or await client.get_me()
-    return InlineKeyboardMarkup([
-        [_btn("Verify", "bset:gverify")],
-        [InlineKeyboardButton(_sc("Add To Group"), url=f"https://t.me/{me.username}?startgroup=true")],
-        [_btn("Back", "bset:main")],
-    ])
-
-
-async def _bot_in_group(client: Client, chat_id: int) -> bool:
-    try:
-        member = await client.get_chat_member(chat_id, "me")
-    except Exception:
-        return False
-    return member.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
 
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -370,7 +347,7 @@ async def cb_botsettings(client: Client, query: CallbackQuery):
     elif action == "set" and parts[2] in _VARS:
         key = parts[2]
         _awaiting_input[uid] = (key, query.message.chat.id, query.message.id)
-        await _show(query, _prompt_text(key), _prompt_kb(key))
+        await _show(query, _prompt_text(key), await _prompt_kb(client, key))
 
     elif action == "reset" and parts[2] in _VARS:
         key = parts[2]
@@ -380,23 +357,6 @@ async def cb_botsettings(client: Client, query: CallbackQuery):
 
     elif action == "maint":
         await _show(query, _maint_text(), _maint_kb())
-
-    elif action == "group":
-        await _show(query, _group_text(), await _group_kb(client))
-
-    elif action == "gverify":
-        grp = _get("group")
-        if not isinstance(grp, dict):
-            return await query.answer(
-                "Bot is not in a group yet. Tap Add To Group first.", show_alert=True
-            )
-        if not await _bot_in_group(client, grp["id"]):
-            _reset("group")
-            await _show(query, _group_text(), await _group_kb(client))
-            return await query.answer(
-                "Bot is no longer in that group. Add it again.", show_alert=True
-            )
-        toast = "Verified."
 
     elif action == "setbool":
         _set("maintenance", parts[2] == "1")
@@ -466,12 +426,3 @@ async def handle_botsettings_value_input(client: Client, message: Message):
             reply_markup=_detail_kb(key), parse_mode=ParseMode.DISABLED,
         )
 
-
-@Client.on_message(filters.new_chat_members & filters.group, group=49)
-async def record_group_add(client: Client, message: Message):
-    """Remember the group when the owner adds this bot to one (used by Verify)."""
-    if not any(u.is_self for u in message.new_chat_members):
-        return
-    if not message.from_user or not _is_owner(message.from_user.id):
-        return
-    _set("group", {"id": message.chat.id, "title": message.chat.title or ""})
