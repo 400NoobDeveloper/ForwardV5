@@ -1,28 +1,18 @@
-FROM python:3.10-slim
+# Don't Remove Credit @VJ_Bots
+# Subscribe YouTube Channel For Amazing Bot @Tech_VJ
+# Ask Doubt on telegram @KingVJ01
 
-# Hide pip's "running as root" warning (safe inside a container)
-ENV PIP_ROOT_USER_ACTION=ignore
+FROM python:3.10-slim-bookworm
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    git \
-    ffmpeg \
-    libsm6 \
-    libxext6 \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get upgrade -y \
+ && apt-get install -y --no-install-recommends git \
+ && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt /requirements.txt
 
-# Set working directory
-WORKDIR /app
+RUN cd /
+RUN pip3 install -U pip && pip3 install -U -r requirements.txt
+RUN mkdir /VJ-FILTER-BOT
+WORKDIR /VJ-FILTER-BOT
+COPY . /VJ-FILTER-BOT
+CMD ["python", "bot.py"]
 
-# Copy requirements file
-COPY requirements.txt .
-
-# Install Python dependencies
-RUN pip3 install --no-cache-dir -U pip && \
-    pip3 install --no-cache-dir -U -r requirements.txt
-
-# Copy the rest of the application code
-COPY . .
-
-# Command to run the bot
-CMD ["python3", "main.py"]
