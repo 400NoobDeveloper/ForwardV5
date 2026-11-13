@@ -43,8 +43,11 @@ Steps for a video file:
   6. Animation genre (+ Asian origin language, movies and TV) -> anime. Western-made
      animated TV that is clearly anime-style (e.g. Blue Eye Samurai: English
      original language, Japan setting) is caught by a TMDB keyword check
-     (anime / manga / japan / samurai / ...). Set ANIME_ALL_ANIMATION=1 to
-     treat every animated title as anime instead.
+     (anime / manga / japan / samurai / ...). Western-made animated MOVIES get
+     the same check but only with the explicit anime words (anime / manga /
+     isekai / ...), never "japan" or "ninja", so e.g. Ninja Turtles stays a
+     movie. Set ANIME_ALL_ANIMATION=1 to treat every animated title as anime
+     instead.
   7. Optional AniList second opinion (per-user toggle in /settings ->
      AniList, no API key needed). It is asked ONLY when TMDB is unsure:
      TMDB found an animated series that isn't anime-language, or TMDB found
@@ -81,8 +84,19 @@ Steps for a video file:
         / lecture names are excluded. With /autosortai, OpenAI gets the
         first say, this fallback only applies if OpenAI says "other".
 
+ 10. Series-like names never become movies: if ANY candidate name of a file
+     carries "Episode N" / "S01E02" / "Season N" / "S01", every candidate of
+     that file is looked up as TV only (see "series_like" in _parse_name()).
+
 Non-video routing (pdf / image / audio / files / other) is extension
 based, exactly as before.
+
+/autosort's Movie channel has extra gates that are NOT part of
+classify_async() (so /fwd behaves as before): movie_thumb_gate() (thumbnail
+aspect ratio), movie_duration_minutes() + MOVIE_MIN_MINUTES, and
+tmdb_movie_runtime() + runtime_mismatch(). handlers/autosort.py applies them
+after classify_async() and sends a failing file to Other. See the
+"/autosort Movie-channel gates" section at the end of this file.
 
 NSFW: nsfw_category() is a separate,
 keyword-based check on the RAW filename + caption. /autosort and
@@ -96,6 +110,7 @@ ThePornDB about video files that still ended up in "other".
 import os
 import re
 import json
+import math
 import asyncio
 import datetime
 import logging
@@ -274,6 +289,13 @@ def _strip_release_noise(name: str) -> str:
 _EP_MARKER_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:episodes?|ep|epi|एपिसोड)\.?[\s._#:-]*0*\d{1,4}(?![0-9])"
     r"|(?<![A-Za-z0-9])s\d{1,2}[ ._-]?e\d{1,4}(?![0-9])",
+    re.IGNORECASE,
+)
+
+# "Season 2" / "S02" (a season pack). Together with _EP_MARKER_RE this is what
+# "series_like" means in _parse_name(): series naming even if guessit missed it.
+_SEASON_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:seasons?[\s._-]*0*\d{1,2}|s0*\d{1,2})(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 
@@ -476,7 +498,7 @@ def _parse_name(raw: str, check_extra: bool = False):
     """Parse one candidate name. Returns a dict or None if no usable title.
 
     keys: titles (best first), year, is_episode, gtype, weak, anime_tag,
-          has_movie_signal, extra
+          has_movie_signal, extra, series_like
     """
     if not raw:
         return None
@@ -549,6 +571,8 @@ def _parse_name(raw: str, check_extra: bool = False):
         "has_movie_signal": bool(g.get("year")) or bool(g.get("release_group")),
         "strong_episode": strong_episode,
         "extra": extra,
+        # explicit "Episode N" / "S01E02" / "Season N" / "S01" in this name
+        "series_like": bool(strong_episode or _SEASON_RE.search(name)),
     }
 
 
@@ -718,6 +742,13 @@ _ANIME_KEYWORDS = {
     "shounen", "shonen", "seinen", "shoujo", "shojo", "mecha",
     "japan", "japanese", "feudal japan", "edo period", "sengoku period",
     "samurai", "ronin", "ninja", "shogun", "yakuza", "kyoto, japan", "tokyo, japan",
+}
+# Animated MOVIES made outside Asia only count as anime when TMDB's keywords say
+# so explicitly. The geographic words above (japan / ninja / samurai ...) are
+# left out on purpose: they also tag plain Western cartoons (Ninja Turtles).
+_ANIME_MOVIE_KEYWORDS = {
+    "anime", "manga", "based on manga", "based on light novel", "isekai",
+    "shounen", "shonen", "seinen", "shoujo", "shojo",
 }
 _ANIME_KEYWORD_IDS = {210024}   # TMDB keyword "anime"
 # Opt-in: every animated movie/show goes to anime (cartoons included).
@@ -1021,6 +1052,51 @@ async def _tmdb_keywords(session, media_type: str, tmdb_id, tmdb_key: str):
     return _TMDB_ERROR
 
 
+_RUNTIME_CACHE: "OrderedDict" = OrderedDict()     # tmdb movie id -> runtime in minutes (0 = TMDB has none)
+
+
+async def _tmdb_runtime(session, tmdb_id, tmdb_key: str):
+    """Runtime in minutes of one TMDB movie (0 = TMDB lists none), or
+    _TMDB_ERROR. Same session / retries / timeout as the other TMDB calls."""
+    hit = _RUNTIME_CACHE.get(tmdb_id)
+    if hit is not None:
+        _RUNTIME_CACHE.move_to_end(tmdb_id)
+        return hit
+    for attempt in range(TMDB_RETRIES):
+        try:
+            async with session.get(
+                f"{TMDB_BASE}/movie/{tmdb_id}",
+                params={"api_key": tmdb_key},
+                timeout=aiohttp.ClientTimeout(total=TMDB_TIMEOUT_SECONDS),
+            ) as resp:
+                if resp.status == 429:
+                    try:
+                        wait = int(resp.headers.get("Retry-After", 2))
+                    except (TypeError, ValueError):
+                        wait = 2
+                    await asyncio.sleep(min(max(wait, 1), 15))
+                    continue
+                if resp.status >= 500:
+                    await asyncio.sleep(1 + attempt)
+                    continue
+                if resp.status != 200:
+                    return _TMDB_ERROR
+                payload = await resp.json()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug("TMDB runtime failed for movie/%s: %s", tmdb_id, e)
+            await asyncio.sleep(1 + attempt)
+            continue
+        runtime = payload.get("runtime") if isinstance(payload, dict) else None
+        runtime = runtime if isinstance(runtime, int) and not isinstance(runtime, bool) and runtime > 0 else 0
+        _RUNTIME_CACHE[tmdb_id] = runtime
+        if len(_RUNTIME_CACHE) > _CACHE_MAX:
+            _RUNTIME_CACHE.popitem(last=False)
+        return runtime
+    return _TMDB_ERROR
+
+
 _ALT_TITLE_CACHE: "OrderedDict" = OrderedDict()   # (media_type, tmdb id) -> list of title strings
 
 
@@ -1095,11 +1171,13 @@ async def _match_by_alt_titles(session, results, media_type: str, queries, year,
     return None
 
 
-def _keywords_say_anime(keywords) -> bool:
+def _keywords_say_anime(keywords, strict: bool = False) -> bool:
+    """strict=True (movies): only the explicit anime words, see _ANIME_MOVIE_KEYWORDS."""
+    words = _ANIME_MOVIE_KEYWORDS if strict else _ANIME_KEYWORDS
     for k in keywords or []:
         if k.get("id") in _ANIME_KEYWORD_IDS:
             return True
-        if (k.get("name") or "").strip().lower() in _ANIME_KEYWORDS:
+        if (k.get("name") or "").strip().lower() in words:
             return True
     return False
 
@@ -1141,10 +1219,30 @@ def _best_match(results, media_type: str, queries, year, strict: bool, prefer_an
     return best
 
 
+class _Ident(tuple):
+    """What _tmdb_identify_core() returns: ("found" | "none" | "error", kind, animated).
+
+    It IS that 3-tuple, so `status, kind, animated = await _tmdb_identify_core(...)`
+    keeps working for every existing caller. It also carries two attributes for
+    /autosort's movie gates: .tmdb_id (id of the matched TMDB title) and
+    .media_type ("movie" | "tv"); both None when nothing matched."""
+    tmdb_id = None
+    media_type = None
+
+    def __new__(cls, status, kind, animated, tmdb_id=None, media_type=None):
+        self = super().__new__(cls, (status, kind, animated))
+        self.tmdb_id = tmdb_id
+        self.media_type = media_type
+        return self
+
+
 async def _tmdb_identify_core(session, tmdb_key: str, p: dict):
-    """-> ("found", kind, animated) | ("none", None, False) | ("error", None, False).
+    """-> ("found", kind, animated) | ("none", None, False) | ("error", None, False)
+    (an _Ident: that tuple plus .tmdb_id / .media_type).
     `animated` = the TMDB match carries the Animation genre."""
-    order = ["tv"] if p["is_episode"] else ["movie", "tv"]
+    # Episode / season naming (this name, or any other name of the same file:
+    # see "series_like" in classify_async) is only ever looked up as TV.
+    order = ["tv"] if (p["is_episode"] or p.get("series_like")) else ["movie", "tv"]
     queries = [_norm_cmp(t) for t in p["titles"]]
     errored = False
     for media_type in order:
@@ -1168,27 +1266,38 @@ async def _tmdb_identify_core(session, tmdb_key: str, p: dict):
                     session, results, media_type, queries, p["year"], p["weak"], tmdb_key)
             if match:
                 animated = TMDB_ANIMATION_GENRE_ID in (match.get("genre_ids") or [])
+                mid = match.get("id")
                 if _is_anime_result(match, media_type):
-                    return "found", "anime", animated
-                # Animated show whose original language isn't ja/zh/ko
-                # (e.g. Blue Eye Samurai): ask TMDB's keywords.
-                if media_type == "tv" and animated and match.get("id"):
-                    kws = await _tmdb_keywords(session, "tv", match["id"], tmdb_key)
+                    return _Ident("found", "anime", animated, mid, media_type)
+                # Animated title whose original language isn't ja/zh/ko
+                # (e.g. Blue Eye Samurai): ask TMDB's keywords. Movies use the
+                # strict anime-words-only list (live-action manga adaptations
+                # are not animated, so they never get here).
+                if animated and mid:
+                    kws = await _tmdb_keywords(session, media_type, mid, tmdb_key)
                     if kws is _TMDB_ERROR:
-                        return "error", None, False   # don't guess during an outage
-                    if _keywords_say_anime(kws):
-                        return "found", "anime", animated
-                return "found", ("movie" if media_type == "movie" else "series"), animated
-    return ("error" if errored else "none"), None, False
+                        return _Ident("error", None, False)   # don't guess during an outage
+                    if _keywords_say_anime(kws, strict=(media_type == "movie")):
+                        return _Ident("found", "anime", animated, mid, media_type)
+                return _Ident("found", ("movie" if media_type == "movie" else "series"),
+                              animated, mid, media_type)
+    return _Ident("error" if errored else "none", None, False)
 
 
-async def _tmdb_identify(session, tmdb_key: str, p: dict, use_anilist: bool = False, anilist_key: str = ""):
+async def _tmdb_identify(session, tmdb_key: str, p: dict, use_anilist: bool = False, anilist_key: str = "", info=None):
     """-> ("found", kind) | ("none", None) | ("error", None).
 
     With use_anilist, AniList gets a say ONLY when TMDB is unsure: nothing
     found, TMDB unreachable, or an animated series TMDB couldn't call anime.
-    Live-action matches and TMDB-confirmed anime are never touched."""
-    status, kind, animated = await _tmdb_identify_core(session, tmdb_key, p)
+    Live-action matches and TMDB-confirmed anime are never touched.
+
+    info: optional dict that receives "tmdb_id" / "tmdb_media" of a TMDB match
+    (read by /autosort; the result itself is not affected)."""
+    ident = await _tmdb_identify_core(session, tmdb_key, p)
+    status, kind, animated = ident
+    if info is not None and status == "found":
+        info["tmdb_id"] = ident.tmdb_id
+        info["tmdb_media"] = ident.media_type
     if not use_anilist:
         return status, kind
     if status == "found" and not (kind in ("series", "movie") and animated):
@@ -1495,13 +1604,17 @@ async def tpdb_category(message, mapping, key: str, session=None):
     return target if await tpdb_known(message, key, session) else None
 
 
-async def classify_async(message, session=None, tmdb_key: str = "", use_anilist: bool = False, anilist_key: str = "", openai_key: str = "") -> str:
+async def classify_async(message, session=None, tmdb_key: str = "", use_anilist: bool = False, anilist_key: str = "", openai_key: str = "", info=None) -> str:
     """Category for forwarding. Videos are routed to movie / series /
     anime ONLY when TMDB confirms the title; otherwise "unidentified"
     (or "tmdb_error") is returned, which no channel maps to -> skipped.
 
     Without a TMDB key (or without aiohttp/guessit) this falls back to the
     filename-only guess from classify().
+
+    info: optional dict. When TMDB matched the file it receives "tmdb_id" and
+    "tmdb_media" ("movie" | "tv"). /autosort uses them for its runtime check
+    and its log line; passing it never changes the returned category.
     """
     early, names, is_files = _early_category(message)
     if early is not None:
@@ -1527,13 +1640,24 @@ async def classify_async(message, session=None, tmdb_key: str = "", use_anilist:
 
     parsed = []
     for i, raw in enumerate(names):
-        p = _parse_name(raw, check_extra=(i == 0 and bool(get_filename(message))))
+        # The first name (the file name, or - for native videos that have none -
+        # the first caption line) is checked for sample / trailer / teaser ...
+        # Before this was skipped when there was no file name, so a caption-only
+        # "Movie (2025) Official Trailer" was matched to the movie on TMDB.
+        p = _parse_name(raw, check_extra=(i == 0))
         if p:
             parsed.append(p)
     if not parsed:
         return await _other_or_openai(message, names, is_files, session, openai_key)
     if parsed[0]["extra"]:
         return "other"
+    if any(pp.get("series_like") for pp in parsed):
+        # One name says "Episode 5" / "S01E02" / "Season 2": look up ALL names of
+        # this file as TV only. Before, another name (a plain caption line without
+        # a marker) was still searched as a movie and could turn an episode into
+        # a movie that merely shares the show's title.
+        for pp in parsed:
+            pp["series_like"] = True
 
     owns_session = session is None
     if owns_session:
@@ -1541,7 +1665,7 @@ async def classify_async(message, session=None, tmdb_key: str = "", use_anilist:
     try:
         errored = False
         for p in parsed:
-            status, kind = await _tmdb_identify(session, tmdb_key, p, use_anilist, anilist_key)
+            status, kind = await _tmdb_identify(session, tmdb_key, p, use_anilist, anilist_key, info)
             if status == "found":
                 return _finish(kind)
             if status == "error":
@@ -1564,3 +1688,138 @@ async def matches_async(message, wanted: str, session=None, tmdb_key: str = "", 
     if not wanted or wanted == "all":
         return True
     return await classify_async(message, session, tmdb_key, use_anilist, anilist_key, openai_key) == wanted
+
+
+# ============================================================
+# /autosort Movie-channel gates
+# ============================================================
+# Deliberately NOT inside classify_async(): /fwd shares that function and must
+# keep behaving as before. handlers/autosort.py calls these helpers after
+# classify_async() returned "movie" / "movie_files" and sends the file to the
+# Other channel when a gate fails (nothing is ever dropped).
+#
+# Env vars (all optional):
+#   MOVIE_THUMB_RATIO_MIN / MOVIE_THUMB_RATIO_MAX   accepted thumbnail width/height
+#                                                   band, default 1.30 .. 2.40
+#   MOVIE_RATIO_UNKNOWN   "other" (default) | "allow": no thumbnail size at all
+#   MOVIE_MIN_MINUTES     shorter videos are not movies, default 45
+#   MOVIE_RUNTIME_TOLERANCE  allowed |file - TMDB runtime| / TMDB runtime, default 0.35
+_DEFAULT_THUMB_RATIO_MIN = 1.30
+_DEFAULT_THUMB_RATIO_MAX = 2.40
+_DEFAULT_MIN_MINUTES = 45.0
+_DEFAULT_RUNTIME_TOLERANCE = 0.35
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+    return value if math.isfinite(value) else default
+
+
+MOVIE_THUMB_RATIO_MIN = _env_float("MOVIE_THUMB_RATIO_MIN", _DEFAULT_THUMB_RATIO_MIN)
+MOVIE_THUMB_RATIO_MAX = _env_float("MOVIE_THUMB_RATIO_MAX", _DEFAULT_THUMB_RATIO_MAX)
+if not 0 < MOVIE_THUMB_RATIO_MIN < MOVIE_THUMB_RATIO_MAX:
+    logger.warning(
+        "MOVIE_THUMB_RATIO_MIN/MAX (%s / %s) are not a valid range - using %s / %s",
+        MOVIE_THUMB_RATIO_MIN, MOVIE_THUMB_RATIO_MAX, _DEFAULT_THUMB_RATIO_MIN, _DEFAULT_THUMB_RATIO_MAX,
+    )
+    MOVIE_THUMB_RATIO_MIN, MOVIE_THUMB_RATIO_MAX = _DEFAULT_THUMB_RATIO_MIN, _DEFAULT_THUMB_RATIO_MAX
+
+MOVIE_RATIO_UNKNOWN = os.environ.get("MOVIE_RATIO_UNKNOWN", "other").strip().lower()
+if MOVIE_RATIO_UNKNOWN not in ("other", "allow"):
+    MOVIE_RATIO_UNKNOWN = "other"
+
+MOVIE_MIN_MINUTES = max(0.0, _env_float("MOVIE_MIN_MINUTES", _DEFAULT_MIN_MINUTES))   # 0 = guard off
+MOVIE_RUNTIME_TOLERANCE = _env_float("MOVIE_RUNTIME_TOLERANCE", _DEFAULT_RUNTIME_TOLERANCE)
+if MOVIE_RUNTIME_TOLERANCE <= 0:
+    MOVIE_RUNTIME_TOLERANCE = _DEFAULT_RUNTIME_TOLERANCE
+
+
+def _movie_media(message):
+    """The Video, or the Document when it is a video-extension file; else None."""
+    video = getattr(message, "video", None)
+    if video is not None:
+        return video
+    doc = getattr(message, "document", None)
+    if doc is not None:
+        name = getattr(doc, "file_name", None) or ""
+        if os.path.splitext(_strip_split_suffix(name))[1].lower() in VIDEO_EXTENSIONS:
+            return doc
+    return None
+
+
+def _positive_dims(obj):
+    """(width, height) as floats when both are positive numbers, else None."""
+    try:
+        w = float(getattr(obj, "width", None) or 0)
+        h = float(getattr(obj, "height", None) or 0)
+    except (TypeError, ValueError):
+        return None
+    return (w, h) if w > 0 and h > 0 else None
+
+
+def movie_thumb_gate(message):
+    """-> (ok, ratio, source): does this video look like a normal landscape
+    video preview?
+
+    Ratio (width / height) comes from, in this order:
+      "thumb"   the LARGEST entry (width * height) of media.thumbs
+      "video"   media.width / media.height, when there is no usable thumbnail
+      "unknown" neither exists -> ratio None
+    ok is True when MOVIE_THUMB_RATIO_MIN <= ratio <= MOVIE_THUMB_RATIO_MAX
+    (default 1.30 .. 2.40: 4:3 up to scope-wide; square and portrait posters
+    fail). With an unknown ratio ok follows MOVIE_RATIO_UNKNOWN ("other" ->
+    False, "allow" -> True)."""
+    media = _movie_media(message)
+    ratio, source = None, "unknown"
+    if media is not None:
+        best_area = 0.0
+        for thumb in getattr(media, "thumbs", None) or []:
+            dims = _positive_dims(thumb)
+            if dims and dims[0] * dims[1] > best_area:
+                best_area = dims[0] * dims[1]
+                ratio, source = dims[0] / dims[1], "thumb"
+        if ratio is None:
+            dims = _positive_dims(media)
+            if dims:
+                ratio, source = dims[0] / dims[1], "video"
+    if ratio is None:
+        return MOVIE_RATIO_UNKNOWN == "allow", None, "unknown"
+    return MOVIE_THUMB_RATIO_MIN <= ratio <= MOVIE_THUMB_RATIO_MAX, ratio, source
+
+
+def movie_duration_minutes(message):
+    """Length of the video in minutes, or None when unknown. Documents carry no
+    duration in Pyrogram, and a duration of 0 means "not set", so both give None
+    (the duration guard and the runtime check are then skipped)."""
+    seconds = getattr(_movie_media(message), "duration", None)
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or seconds <= 0:
+        return None
+    return seconds / 60.0
+
+
+async def tmdb_movie_runtime(session, tmdb_id, tmdb_key: str = "") -> int:
+    """TMDB runtime in minutes for a movie id; 0 when TMDB has none or the
+    lookup failed (so it can never block a movie). Cached by TMDB id."""
+    tmdb_key = tmdb_key or ENV_TMDB_API_KEY
+    if not tmdb_id or not tmdb_key or aiohttp is None:
+        return 0
+    owns = session is None
+    if owns:
+        session = aiohttp.ClientSession()
+    try:
+        runtime = await _tmdb_runtime(session, tmdb_id, tmdb_key)
+    finally:
+        if owns:
+            await session.close()
+    return 0 if runtime is _TMDB_ERROR else runtime
+
+
+def runtime_mismatch(file_minutes, runtime_minutes) -> bool:
+    """True when both lengths are known and the file differs from TMDB's runtime
+    by more than MOVIE_RUNTIME_TOLERANCE (default 35 %) of that runtime."""
+    if not file_minutes or not runtime_minutes or file_minutes <= 0 or runtime_minutes <= 0:
+        return False
+    return abs(file_minutes - runtime_minutes) / runtime_minutes > MOVIE_RUNTIME_TOLERANCE
