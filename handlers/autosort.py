@@ -14,7 +14,10 @@
 # /settings -> Filters exclude (type / extension / keyword / size /
 # whitelist). If a "Duplicate" channel is set in /settings -> Channels ->
 # "Auto-Sort Channels", duplicates are forwarded there instead of skipped
-# (this applies to /autosort only). Everything else that can't be sorted into a specific
+# (this applies to /autosort only). The Movie channel is stricter: a file the classifier
+# calls a movie only goes there when its length, thumbnail shape and TMDB runtime look
+# like a real movie (see _movie_gate()); otherwise it goes to Other.
+# Everything else that can't be sorted into a specific
 # category (no channel mapped for it, TMDB unreachable, unsupported
 # message type, ...) is added to the "Other" channel, so nothing has
 # to be forwarded by hand afterwards.
@@ -43,6 +46,8 @@ from plugins.controls import Translation, CLIENT, start_clone_bot, target_link, 
 from plugins.classify import (
     classify_async, CATEGORIES, VIDEO_CATEGORIES, SKIP_CATEGORIES,
     UNIDENTIFIED, TMDB_UNAVAILABLE, ENV_TMDB_API_KEY,
+    get_filename, movie_thumb_gate, movie_duration_minutes, tmdb_movie_runtime, runtime_mismatch,
+    MOVIE_MIN_MINUTES, MOVIE_THUMB_RATIO_MIN, MOVIE_THUMB_RATIO_MAX,
 )
 from pyrogram.enums import ParseMode
 from plugins.utils import check_filters, caption_for_copy, text_without_links
@@ -380,6 +385,9 @@ def _category_popup(stats: dict, mapping: dict) -> str:
     for base, name in _POPUP_PAIRS:
         if base in mapping or f"{base}_files" in mapping:
             lines.append(f"{name} {stats.get(base, 0)}/{stats.get(base + '_files', 0)}")
+            if base == "movie":
+                # movies sent to Other by the thumbnail-ratio gate
+                lines.append(f"Ratio→Other {stats.get('ratio_other', 0)}")
     for key, name in _POPUP_SINGLES:
         if key in mapping:
             lines.append(f"{name} {stats.get(key, 0)}")
@@ -420,11 +428,81 @@ async def _copy_with_retry(client, dest, from_chat, msg_id, m, stats, mapping, p
         return False
 
 
+# ── Movie-channel gate ──────────────────────────────────────
+# classify_async() is shared with /fwd, so the extra checks that keep the Movie
+# channel to real, landscape-thumbnail movies live here, not in the classifier.
+MOVIE_GATE_CATEGORIES = ("movie", "movie_files")
+
+
+async def _movie_gate(message, category, info, session, tmdb_key):
+    """Checks a file the classifier called movie / movie_files. First failure
+    wins and the file becomes "other" (never dropped):
+      1. duration known and < MOVIE_MIN_MINUTES     -> a clip, trailer or short
+      2. thumbnail ratio outside the band / unknown -> poster-style thumbnail
+      3. duration vs TMDB runtime off by > tolerance -> not that film
+    Returns a dict: category (final), reason (None = unchanged), ratio_hit
+    (failed on the ratio gate), ratio, source, minutes, tmdb_id."""
+    ok, ratio, source = movie_thumb_gate(message)
+    minutes = movie_duration_minutes(message)
+    tmdb_id = info.get("tmdb_id") if info.get("tmdb_media") == "movie" else None
+    reason, ratio_hit = None, False
+    if minutes is not None and minutes < MOVIE_MIN_MINUTES:
+        reason = f"duration {minutes:.0f}m -> other"
+    elif not ok:
+        ratio_hit = True
+        if ratio is None:
+            reason = "ratio unknown -> other"
+        elif ratio < 1.0:
+            reason = f"ratio {ratio:.2f} poster -> other"
+        else:
+            reason = f"ratio {ratio:.2f} outside {MOVIE_THUMB_RATIO_MIN:g}-{MOVIE_THUMB_RATIO_MAX:g} -> other"
+    elif tmdb_id and minutes is not None:
+        # only worth a TMDB call when the file's own length is known
+        runtime = await tmdb_movie_runtime(session, tmdb_id, tmdb_key)
+        if runtime_mismatch(minutes, runtime):
+            reason = f"runtime mismatch {minutes:.0f}m vs TMDB {runtime}m -> other"
+    return {
+        "category": "other" if reason else category, "reason": reason, "ratio_hit": ratio_hit,
+        "ratio": ratio, "source": source, "minutes": minutes, "tmdb_id": tmdb_id,
+    }
+
+
+def _movie_label(message) -> str:
+    """File name, else the first caption line (for the log)."""
+    name = get_filename(message)
+    if not name:
+        for line in (getattr(message, "caption", None) or "").splitlines():
+            if line.strip():
+                name = line.strip()
+                break
+    return (name or "-")[:80]
+
+
+def _log_movie_route(message, classified, gated, final, gate, info):
+    """ONE INFO line per movie / movie_files file (and per TMDB movie the
+    classifier already moved to anime): what it was, what was measured, where it went."""
+    notes = []
+    if gate and gate["reason"]:
+        notes.append(gate["reason"])
+    elif classified.startswith("anime"):
+        notes.append("anime origin -> anime")
+    if final != gated:
+        notes.append("no channel mapped -> other")
+    gate = gate or {}
+    ratio, minutes = gate.get("ratio"), gate.get("minutes")
+    logger.info(
+        "autosort movie-route: msg=%s name=%r class=%s tmdb=%s ratio=%s src=%s dur=%s final=%s reason=%s",
+        message.id, _movie_label(message), classified, info.get("tmdb_id") or "-",
+        f"{ratio:.2f}" if ratio is not None else "-", gate.get("source", "-"),
+        f"{minutes:.0f}m" if minutes is not None else "-", final, "; ".join(notes) or "-",
+    )
+
+
 async def _run(client, user_id, m, cfg):
     mapping = cfg["mapping"]
     from_chat = cfg["from_chat"]
     stats = {"fetched": 0, "forwarded": 0, "unsorted": 0, "errors": 0, "filtered": 0, "fallback": 0, "duplicate": 0,
-             UNIDENTIFIED: 0, TMDB_UNAVAILABLE: 0, "start": time.time()}
+             "ratio_other": 0, UNIDENTIFIED: 0, TMDB_UNAVAILABLE: 0, "start": time.time()}
     for category in mapping:
         stats[category] = 0
 
@@ -517,17 +595,29 @@ async def _run(client, user_id, m, cfg):
                     stats["filtered"] = stats.get("filtered", 0) + 1
                     continue
 
-            category = await classify_async(message, tmdb_session, tmdb_key, use_anilist, anilist_key)
+            info = {}   # filled by classify_async with the TMDB id of the match
+            category = await classify_async(message, tmdb_session, tmdb_key, use_anilist, anilist_key, info=info)
             if category in SKIP_CATEGORIES:
                 # TMDB unreachable -> don't drop it, put it in Other.
                 stats[category] += 1
                 category = "other"
+            classified = category
+            # Movie channel gate (duration / thumbnail ratio / TMDB runtime). Done
+            # here, not in classify_async(), which /fwd shares. A file that fails
+            # is not dropped, filtered or counted as an error: it goes to Other.
+            gate = None
+            if classified in MOVIE_GATE_CATEGORIES:
+                gate = await _movie_gate(message, classified, info, tmdb_session, tmdb_key)
+                category = gate["category"]
+            gated = category
             dest = mapping.get(category)
             if dest is None:
                 # No channel mapped for this category -> Other.
                 stats["unsorted"] += 1
                 category = "other"
                 dest = other_dest
+            if gate is not None or (info.get("tmdb_media") == "movie" and classified.startswith("anime")):
+                _log_movie_route(message, classified, gated, category, gate, info)
 
             # Caption -> just the media/movie name line; None = leave caption as is.
             ok = await _copy_with_retry(
@@ -545,7 +635,9 @@ async def _run(client, user_id, m, cfg):
                     category = "other"
             if ok:
                 stats["forwarded"] += 1
-                stats[category] = stats.get(category, 0) + 1
+                stats[category] = stats.get(category, 0) + 1     # FINAL category ("other" for a gated movie)
+                if gate is not None and gate["ratio_hit"]:
+                    stats["ratio_other"] += 1
                 # Clean run for a while -> ease the pace back down toward the
                 # baseline instead of staying at whatever a past FloodWait
                 # pushed it to forever.
