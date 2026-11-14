@@ -16,7 +16,10 @@
 # "Auto-Sort Channels", duplicates are forwarded there instead of skipped
 # (this applies to /autosort only). The Movie channel is stricter: a file the classifier
 # calls a movie only goes there when its length, thumbnail shape and TMDB runtime look
-# like a real movie (see _movie_gate()); otherwise it goes to Other.
+# like a real movie (see _movie_gate()); otherwise it goes to Other. The Series channel is
+# stricter too: only files identified as real series episodes (TMDB / TVmaze / episode
+# marker, see plugins/classify.py "deep SERIES identification") with a normal episode length
+# and a landscape thumbnail go there (see _series_gate()); the rest goes to Other.
 # Everything else that can't be sorted into a specific
 # category (no channel mapped for it, TMDB unreachable, unsupported
 # message type, ...) is added to the "Other" channel, so nothing has
@@ -48,6 +51,7 @@ from plugins.classify import (
     UNIDENTIFIED, TMDB_UNAVAILABLE, ENV_TMDB_API_KEY,
     get_filename, movie_thumb_gate, movie_duration_minutes, tmdb_movie_runtime, runtime_mismatch,
     MOVIE_MIN_MINUTES, MOVIE_THUMB_RATIO_MIN, MOVIE_THUMB_RATIO_MAX,
+    SERIES_MIN_MINUTES, SERIES_MAX_MINUTES, SERIES_THUMB_RATIO_MIN, SERIES_THUMB_RATIO_MAX, SERIES_RATIO_UNKNOWN,
 )
 from pyrogram.enums import ParseMode
 from plugins.utils import check_filters, caption_for_copy, text_without_links
@@ -382,12 +386,14 @@ def _status_markup(state: str) -> InlineKeyboardMarkup:
 def _category_popup(stats: dict, mapping: dict) -> str:
     """Counts per category for the Progressing popup (Telegram allows 200 characters)."""
     lines = ["Video/Files"]
+    ratio_shown = False
     for base, name in _POPUP_PAIRS:
         if base in mapping or f"{base}_files" in mapping:
             lines.append(f"{name} {stats.get(base, 0)}/{stats.get(base + '_files', 0)}")
-            if base == "movie":
-                # movies sent to Other by the thumbnail-ratio gate
+            if base in ("movie", "series") and not ratio_shown:
+                # movies / series sent to Other by the thumbnail-ratio gates (one shared count)
                 lines.append(f"Ratio→Other {stats.get('ratio_other', 0)}")
+                ratio_shown = True
     for key, name in _POPUP_SINGLES:
         if key in mapping:
             lines.append(f"{name} {stats.get(key, 0)}")
@@ -498,6 +504,69 @@ def _log_movie_route(message, classified, gated, final, gate, info):
     )
 
 
+# ── Series-channel gate ─────────────────────────────────────
+# The classifier (deep_series=True) only says "series" for a file it is confident is a
+# real episode; this gate then checks the file itself. Same style as _movie_gate().
+SERIES_GATE_CATEGORIES = ("series", "series_files")
+
+
+def _series_gate(message, category, info):
+    """Checks a file the classifier called series / series_files. First failure
+    wins and the file becomes "other" (never dropped):
+      1. duration known and < SERIES_MIN_MINUTES     -> a clip, promo or teaser
+      2. duration known and > SERIES_MAX_MINUTES     -> a compilation, marathon or film
+      3. thumbnail ratio outside the band / unknown  -> poster-style thumbnail
+    Documents carry no duration, so for them only the thumbnail is checked. The show's
+    own runtime (TMDB / TVmaze) is NOT a veto here, it is only logged.
+    Returns a dict: category (final), reason (None = unchanged), ratio_hit, ratio,
+    source, minutes."""
+    ok, ratio, source = movie_thumb_gate(message, SERIES_THUMB_RATIO_MIN, SERIES_THUMB_RATIO_MAX, SERIES_RATIO_UNKNOWN)
+    minutes = movie_duration_minutes(message) if getattr(message, "video", None) is not None else None
+    reason, ratio_hit = None, False
+    if minutes is not None and minutes < SERIES_MIN_MINUTES:
+        reason = f"duration {minutes:.0f}m below {SERIES_MIN_MINUTES:g}m -> other"
+    elif minutes is not None and minutes > SERIES_MAX_MINUTES:
+        reason = f"duration {minutes:.0f}m above {SERIES_MAX_MINUTES:g}m -> other"
+    elif not ok:
+        ratio_hit = True
+        if ratio is None:
+            reason = "ratio unknown -> other"
+        elif ratio < 1.0:
+            reason = f"ratio {ratio:.2f} poster -> other"
+        else:
+            reason = f"ratio {ratio:.2f} outside {SERIES_THUMB_RATIO_MIN:g}-{SERIES_THUMB_RATIO_MAX:g} -> other"
+    return {
+        "category": "other" if reason else category, "reason": reason, "ratio_hit": ratio_hit,
+        "ratio": ratio, "source": source, "minutes": minutes,
+    }
+
+
+def _log_series_route(message, classified, gated, final, gate, info):
+    """ONE INFO line per series candidate: every file the classifier called series, and
+    every file it looked at as a series but rejected (sample / promo, no second source,
+    course name, ...). Says what it was, how it scored and where it went."""
+    s = info.get("series") or {}
+    notes = []
+    if gate and gate["reason"]:
+        notes.append(gate["reason"])
+    if s.get("reason") and s["reason"] != "ok":
+        notes.append(s["reason"])
+    if final != gated:
+        notes.append("no channel mapped -> other")
+    gate = gate or {}
+    ratio = gate.get("ratio")
+    minutes = gate["minutes"] if "minutes" in gate else movie_duration_minutes(message)
+    runtime = s.get("runtime")
+    logger.info(
+        "autosort series-route: msg=%s name=%r class=%s source=%s id=%s score=%s signals=%s ratio=%s src=%s dur=%s rt=%s final=%s reason=%s",
+        message.id, _movie_label(message), classified, s.get("source") or "-", s.get("id") or "-",
+        s.get("score", 0), ",".join(s.get("signals") or []) or "-",
+        f"{ratio:.2f}" if ratio is not None else "-", gate.get("source", "-"),
+        f"{minutes:.0f}m" if minutes is not None else "-", f"{runtime}m" if runtime else "-",
+        final, "; ".join(notes) or "-",
+    )
+
+
 async def _run(client, user_id, m, cfg):
     mapping = cfg["mapping"]
     from_chat = cfg["from_chat"]
@@ -595,8 +664,9 @@ async def _run(client, user_id, m, cfg):
                     stats["filtered"] = stats.get("filtered", 0) + 1
                     continue
 
-            info = {}   # filled by classify_async with the TMDB id of the match
-            category = await classify_async(message, tmdb_session, tmdb_key, use_anilist, anilist_key, info=info)
+            info = {}   # filled by classify_async: the TMDB id of the match, and info["series"] details
+            # deep_series=True is /autosort only: TVmaze + a confidence score decide "series"
+            category = await classify_async(message, tmdb_session, tmdb_key, use_anilist, anilist_key, info=info, deep_series=True)
             if category in SKIP_CATEGORIES:
                 # TMDB unreachable -> don't drop it, put it in Other.
                 stats[category] += 1
@@ -605,10 +675,14 @@ async def _run(client, user_id, m, cfg):
             # Movie channel gate (duration / thumbnail ratio / TMDB runtime). Done
             # here, not in classify_async(), which /fwd shares. A file that fails
             # is not dropped, filtered or counted as an error: it goes to Other.
-            gate = None
+            gate = sgate = None
             if classified in MOVIE_GATE_CATEGORIES:
                 gate = await _movie_gate(message, classified, info, tmdb_session, tmdb_key)
                 category = gate["category"]
+            elif classified in SERIES_GATE_CATEGORIES:
+                # Same idea for the Series channel: episode length + landscape thumbnail.
+                sgate = _series_gate(message, classified, info)
+                category = sgate["category"]
             gated = category
             dest = mapping.get(category)
             if dest is None:
@@ -618,6 +692,8 @@ async def _run(client, user_id, m, cfg):
                 dest = other_dest
             if gate is not None or (info.get("tmdb_media") == "movie" and classified.startswith("anime")):
                 _log_movie_route(message, classified, gated, category, gate, info)
+            if sgate is not None or (info.get("series") or {}).get("candidate"):
+                _log_series_route(message, classified, gated, category, sgate, info)
 
             # Caption -> just the media/movie name line; None = leave caption as is.
             ok = await _copy_with_retry(
@@ -636,7 +712,7 @@ async def _run(client, user_id, m, cfg):
             if ok:
                 stats["forwarded"] += 1
                 stats[category] = stats.get(category, 0) + 1     # FINAL category ("other" for a gated movie)
-                if gate is not None and gate["ratio_hit"]:
+                if (gate is not None and gate["ratio_hit"]) or (sgate is not None and sgate["ratio_hit"]):
                     stats["ratio_other"] += 1
                 # Clean run for a while -> ease the pace back down toward the
                 # baseline instead of staying at whatever a past FloodWait
