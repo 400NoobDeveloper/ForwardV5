@@ -20,7 +20,10 @@
 # stricter too: only files identified as real series episodes (TMDB / TVmaze / episode
 # marker, see plugins/classify.py "deep SERIES identification") with a thumbnail, a normal
 # episode length and a landscape thumbnail shape go there (see _series_gate()); the rest
-# goes to Other.
+# goes to Other. The Anime channel has the same kind of gate (see _anime_gate()): only files
+# identified as real anime (AniList / Jikan / TMDB / anime list, see plugins/classify.py
+# "deep ANIME identification") with a thumbnail, a normal length and a landscape thumbnail
+# shape go there; the rest goes to Other.
 # Everything else that can't be sorted into a specific
 # category (no channel mapped for it, TMDB unreachable, unsupported
 # message type, ...) is added to the "Other" channel, so nothing has
@@ -54,6 +57,8 @@ from plugins.classify import (
     MOVIE_MIN_MINUTES, MOVIE_THUMB_RATIO_MIN, MOVIE_THUMB_RATIO_MAX,
     SERIES_MIN_MINUTES, SERIES_MAX_MINUTES, SERIES_THUMB_RATIO_MIN, SERIES_THUMB_RATIO_MAX, SERIES_RATIO_UNKNOWN,
     SERIES_REQUIRE_THUMB,
+    ANIME_MIN_MINUTES, ANIME_MAX_MINUTES, ANIME_THUMB_RATIO_MIN, ANIME_THUMB_RATIO_MAX, ANIME_RATIO_UNKNOWN,
+    ANIME_REQUIRE_THUMB,
 )
 from pyrogram.enums import ParseMode
 from plugins.utils import check_filters, caption_for_copy, text_without_links
@@ -595,6 +600,85 @@ def _log_series_to_anime(message, classified, final, info):
     )
 
 
+# ── Anime-channel gate ──────────────────────────────────────
+# The classifier (deep_anime=True) only says "anime" for a file AniList / Jikan / TMDB / the anime
+# list vouch for; this gate then checks the file itself. Same style as _series_gate().
+ANIME_GATE_CATEGORIES = ("anime", "anime_files")
+
+
+def _anime_gate(message, category, info):
+    """Checks a file the classifier called anime / anime_files. First failure wins and the file
+    becomes "other" (never dropped):
+      1. no thumbnail at all (ANIME_REQUIRE_THUMB)  -> a blank preview is not a proper episode
+      2. duration known and < ANIME_MIN_MINUTES     -> a clip, opening, AMV
+      3. duration known and > ANIME_MAX_MINUTES     -> a compilation or marathon
+      4. thumbnail ratio outside the band / unknown -> poster / portrait / square thumbnail
+    Documents carry no duration, so for them only the thumbnail is checked. The video's own
+    width / height never rescues a missing thumbnail, and there is no file-size or bitrate rule.
+    No thumbnail counts as a thumbnail reject (ratio_hit), so it shares the "Ratio->Other" counter.
+    Returns a dict: category (final), reason (None = unchanged), ratio_hit, ratio, source,
+    minutes, thumb (does the file have a thumbnail)."""
+    ok, ratio, source = movie_thumb_gate(
+        message, ANIME_THUMB_RATIO_MIN, ANIME_THUMB_RATIO_MAX, ANIME_RATIO_UNKNOWN,
+        require_thumb=ANIME_REQUIRE_THUMB)
+    minutes = movie_duration_minutes(message) if getattr(message, "video", None) is not None else None
+    reason, ratio_hit = None, False
+    if source == "no-thumb":
+        ratio_hit = True
+        reason = "no thumbnail -> other"
+    elif minutes is not None and minutes < ANIME_MIN_MINUTES:
+        reason = f"duration {minutes:.1f}m below {ANIME_MIN_MINUTES:g}m -> other"
+    elif minutes is not None and minutes > ANIME_MAX_MINUTES:
+        reason = f"duration {minutes:.0f}m above {ANIME_MAX_MINUTES:g}m -> other"
+    elif not ok:
+        ratio_hit = True
+        if ratio is None:
+            reason = "ratio unknown -> other"
+        elif ratio < 1.0:
+            reason = f"ratio {ratio:.2f} poster -> other"
+        else:
+            reason = f"ratio {ratio:.2f} outside {ANIME_THUMB_RATIO_MIN:g}-{ANIME_THUMB_RATIO_MAX:g} -> other"
+    return {
+        "category": "other" if reason else category, "reason": reason, "ratio_hit": ratio_hit,
+        "ratio": ratio, "source": source, "minutes": minutes, "thumb": has_video_thumb(message),
+    }
+
+
+def _log_anime_route(message, classified, gated, final, gate, info):
+    """ONE INFO line per file the classifier called anime / anime_files, and per file where a TMDB anime
+    verdict was downgraded (the old keyword rule said anime, the new rules did not - e.g. Blue Eye
+    Samurai). Says what it was (cleaned title, language, season / episode), which source decided
+    (anilist | animelist | tmdb | jikan | -) and what that source said (AniList id, format, origin),
+    what the thumbnail and the duration looked like and where it went."""
+    a = info.get("anime") or {}
+    notes = []
+    if gate and gate.get("reason"):
+        notes.append(gate["reason"])
+    if a.get("downgraded"):
+        notes.append("downgraded: " + a["downgraded"])
+    notes += list(a.get("notes") or [])
+    if final != gated:
+        notes.append("no channel mapped -> other")
+    gate = gate or {}
+    ratio = gate.get("ratio")
+    minutes = gate["minutes"] if "minutes" in gate else movie_duration_minutes(message)
+    thumb = gate["thumb"] if "thumb" in gate else has_video_thumb(message)
+    if "ratio" not in gate:
+        _ok, ratio, src = movie_thumb_gate(message)
+    else:
+        src = gate.get("source", "-")
+    logger.info(
+        "autosort anime-route: msg=%s name=%r title=%r lang=%s class=%s source=%s anilist=%s mal=%s fmt=%s origin=%s "
+        "season=%s ep=%s signals=%s thumb=%s ratio=%s src=%s dur=%s final=%s reason=%s",
+        message.id, _movie_label(message), a.get("title") or "-", a.get("language") or "-", classified,
+        a.get("source") or "-", a.get("anilist_id") or "-", a.get("mal_id") or "-", a.get("format") or "-",
+        a.get("origin") or "-", a.get("season") or "-", a.get("episode") or "-",
+        ",".join(a.get("signals") or []) or "-", "yes" if thumb else "no",
+        f"{ratio:.2f}" if ratio is not None else "-", src,
+        f"{minutes:.0f}m" if minutes is not None else "-", final, "; ".join(notes) or "-",
+    )
+
+
 async def _run(client, user_id, m, cfg):
     mapping = cfg["mapping"]
     from_chat = cfg["from_chat"]
@@ -693,8 +777,11 @@ async def _run(client, user_id, m, cfg):
                     continue
 
             info = {}   # filled by classify_async: the TMDB id of the match, and info["series"] details
-            # deep_series=True is /autosort only: TVmaze + a confidence score decide "series"
-            category = await classify_async(message, tmdb_session, tmdb_key, use_anilist, anilist_key, info=info, deep_series=True)
+            # deep_series=True is /autosort only: TVmaze + a confidence score decide "series".
+            # deep_anime=True is /autosort only too: anime name cleaning, AniList (Jikan) before TMDB for
+            # anime candidates, the anime list, no TMDB-keyword anime verdicts (info["anime"] = details)
+            category = await classify_async(message, tmdb_session, tmdb_key, use_anilist, anilist_key, info=info,
+                                            deep_series=True, deep_anime=True)
             if category in SKIP_CATEGORIES:
                 # TMDB unreachable -> don't drop it, put it in Other.
                 stats[category] += 1
@@ -703,7 +790,7 @@ async def _run(client, user_id, m, cfg):
             # Movie channel gate (duration / thumbnail ratio / TMDB runtime). Done
             # here, not in classify_async(), which /fwd shares. A file that fails
             # is not dropped, filtered or counted as an error: it goes to Other.
-            gate = sgate = None
+            gate = sgate = agate = None
             if classified in MOVIE_GATE_CATEGORIES:
                 gate = await _movie_gate(message, classified, info, tmdb_session, tmdb_key)
                 category = gate["category"]
@@ -711,6 +798,10 @@ async def _run(client, user_id, m, cfg):
                 # Same idea for the Series channel: episode length + landscape thumbnail.
                 sgate = _series_gate(message, classified, info)
                 category = sgate["category"]
+            elif classified in ANIME_GATE_CATEGORIES:
+                # ... and for the Anime channel: a thumbnail, a normal length, a landscape thumbnail.
+                agate = _anime_gate(message, classified, info)
+                category = agate["category"]
             gated = category
             dest = mapping.get(category)
             if dest is None:
@@ -724,6 +815,8 @@ async def _run(client, user_id, m, cfg):
                 _log_series_route(message, classified, gated, category, sgate, info)
             if classified.startswith("anime") and (info.get("series") or {}).get("to_anime"):
                 _log_series_to_anime(message, classified, category, info)
+            if classified.startswith("anime") or (info.get("anime") or {}).get("downgraded"):
+                _log_anime_route(message, classified, gated, category, agate or sgate or gate, info)
 
             # Caption -> just the media/movie name line; None = leave caption as is.
             ok = await _copy_with_retry(
@@ -741,8 +834,9 @@ async def _run(client, user_id, m, cfg):
                     category = "other"
             if ok:
                 stats["forwarded"] += 1
-                stats[category] = stats.get(category, 0) + 1     # FINAL category ("other" for a gated movie)
-                if (gate is not None and gate["ratio_hit"]) or (sgate is not None and sgate["ratio_hit"]):
+                stats[category] = stats.get(category, 0) + 1     # FINAL category ("other" for a gated movie / series / anime)
+                if ((gate is not None and gate["ratio_hit"]) or (sgate is not None and sgate["ratio_hit"])
+                        or (agate is not None and agate["ratio_hit"])):
                     stats["ratio_other"] += 1
                 # Clean run for a while -> ease the pace back down toward the
                 # baseline instead of staying at whatever a past FloodWait
