@@ -12,6 +12,7 @@ from pyrogram.errors.exceptions.not_acceptable_406 import ChannelPrivate as Priv
 from plugins.utils import STS
 from core.database import db
 from handlers import botsettings as _bs          # shared Add Me To Group state
+from plugins import autosort_create                 # /settings -> Extra Settings -> AUTOSORT
 try:
     from pyromod.listen.listen import ListenerCanceled
 except Exception:                                 # pyromod missing: never raised
@@ -513,6 +514,73 @@ async def settings_query(bot, query):
      await query.message.edit_text(
         "<b>successfully updated</b>",
         reply_markup=InlineKeyboardMarkup(back_buttons))
+
+  # ── Extra Settings -> AUTOSORT (logic lives in plugins/autosort_create.py) ──
+  elif type=="asmenu":
+     autosort_create.PENDING.pop(user_id, None)
+     text, markup = await autosort_create.menu_page(user_id)
+     await autosort_create.safe_edit(query.message, text, markup, final=True)
+
+  elif type=="asback":
+     # back to Extra Settings: the AUTOSORT pages replaced the message text, so put it back too
+     await query.message.edit_text(
+        "<b><u>💠 CUSTOM FILTERS 💠</b></u>\n\n**configure the type of messages which you want forward**",
+        reply_markup=await next_filters_buttons(user_id))
+
+  elif type=="assession":
+     text, markup = await autosort_create.session_page(user_id)
+     await autosort_create.safe_edit(query.message, text, markup, final=True)
+
+  elif type=="assessionset":
+     await query.message.delete()
+     await autosort_create.set_session_flow(bot, user_id)
+
+  elif type=="assessionreset":
+     await db.remove_autosort_session(user_id)
+     text, markup = await autosort_create.session_page(user_id)
+     await autosort_create.safe_edit(query.message, text, markup, final=True)
+
+  elif type=="assessiontest":
+     await autosort_create.test_session(user_id, query.message)
+
+  elif type=="ascreate":
+     if user_id in autosort_create.RUNNING:
+        return await query.answer("A creation run is already in progress.", show_alert=True)
+     if not await db.get_autosort_session(user_id):
+        text, markup = autosort_create.no_session_page()
+     elif not await autosort_create.unset_categories(user_id):
+        text, markup = autosort_create.all_set_page()
+     else:
+        text, markup = autosort_create.type_page()
+     await autosort_create.safe_edit(query.message, text, markup, final=True)
+
+  elif type.startswith("ascreatetype_"):
+     kind = type.split('_', 1)[1]
+     if kind not in ("channel", "group"):
+        return await query.answer()
+     if user_id in autosort_create.RUNNING:
+        return await query.answer("A creation run is already in progress.", show_alert=True)
+     if not await db.get_autosort_session(user_id):
+        text, markup = autosort_create.no_session_page()
+        return await autosort_create.safe_edit(query.message, text, markup, final=True)
+     await query.message.delete()
+     await autosort_create.prefix_flow(bot, user_id, kind)
+
+  elif type=="asgo":
+     cfg, error = autosort_create.claim_run(user_id)       # takes the lock (no await inside)
+     if error:
+        return await query.answer(error, show_alert=True)
+     try:
+        await query.answer()
+     except Exception:
+        pass
+     await autosort_create.run_creation(user_id, bot, query.message)
+
+  elif type=="ascancel":
+     if autosort_create.request_cancel(user_id):
+        await query.answer("Stopping after the current chat...", show_alert=True)
+     else:
+        await query.answer("No creation run is going.", show_alert=True)
 
   elif type=="privatefiles":
      buttons = [[InlineKeyboardButton('TMDB',
