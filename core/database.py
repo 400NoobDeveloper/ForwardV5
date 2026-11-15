@@ -233,6 +233,23 @@ class Database:
        current['tpdb_key'] = None
        await self.update_configs(user_id, current)
 
+    async def get_autosort_session(self, user_id: int) -> str:
+       """Per-user Pyrogram STRING SESSION used ONLY by /settings -> Extra Settings -> AUTOSORT
+       (plugins/autosort_create.py) to create the Auto-Sort chats. It is a secret: never log or
+       print it. It is NOT the /settings -> Bots entry."""
+       configs = await self.get_configs(user_id)
+       return configs.get('autosort_session') or ''
+
+    async def set_autosort_session(self, user_id: int, value: str):
+       current = await self.get_configs(user_id)
+       current['autosort_session'] = value
+       await self.update_configs(user_id, current)
+
+    async def remove_autosort_session(self, user_id: int):
+       current = await self.get_configs(user_id)
+       current.pop('autosort_session', None)       # delete the key completely, not just blank it
+       await self.update_configs(user_id, current)
+
     async def get_anilist_enabled(self, user_id: int) -> bool:
        """Per-user AniList toggle (/settings -> AniList). No API key needed.
        ON unless the user switched it off (also for users with older configs)."""
