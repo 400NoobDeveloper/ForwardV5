@@ -1025,7 +1025,7 @@ def _build_candidates(shape: dict, extra_titles=()) -> list:
     return out
 
 
-def _parse_name(raw: str, check_extra: bool = False, deep: bool = False):
+def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: bool = False):
     """Parse one candidate name. Returns a dict or None if no usable title.
 
     keys: titles (best first), year, is_episode, gtype, weak, anime_tag,
@@ -1040,15 +1040,27 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False):
     and franchise out of abbreviations ("BBKan"), builds a list of search candidates, treats
     promo / recap as extras even for episodes, counts a bracket as a fansub tag only when it
     is a plausible group name at the START of the name, and records every signal.
+
+    anime=True (only with deep=True, only /autosort's deep_anime mode): also deletes the junk suffix
+    "_Remove" / "_Removed", and fills p["anime"] (see _anime_info(): cleaned title, dub / language
+    signal, groups, season / part / episode, anime-candidate signals), flags NCOP / NCED / AMV ... as
+    extras and, for a strong anime candidate, replaces the title candidates by the cleaned anime ones.
+    Otherwise p["anime"] is None and nothing changes.
     """
     if not raw:
         return None
     if deep:
         raw = _url_decode(raw)
+    anime = bool(anime and deep)
     name = _strip_split_suffix(raw) if _is_split_part(raw) else raw
+    if anime:
+        m_ext = _VIDEO_EXT_END_RE.search(name)
+        body, ext = (name[:m_ext.start()], m_ext.group(0)) if m_ext else (name, "")
+        name = _ANIME_JUNK_SUFFIX_RE.sub("", body) + ext
     name = _strip_release_noise(_clean_name(name))
     if not name:
         return None
+    pre_norm = name                       # the anime cleaner needs the brackets the normaliser deletes
     norm = _normalize_release_name(name) if deep else None
     if norm:
         name = norm["name"]
@@ -1151,7 +1163,7 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False):
     if part_weak:
         signals.append("part")
 
-    return {
+    result = {
         "titles": titles,
         # a date-named episode's year is the AIR year, not the show's release year
         "year": None if date_ep else _as_int(g.get("year")),
@@ -1182,7 +1194,11 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False):
         "junk_removed": bool(norm and norm["junk_removed"]),
         "uploaders": list(norm["uploaders"]) if norm else [],
         "candidates": cands or [],
+        "anime": None,
     }
+    if anime:
+        _anime_attach(result, pre_norm, check_extra)
+    return result
 
 
 def _detect_type(name: str) -> "str | None":
@@ -1470,13 +1486,19 @@ ANILIST_ORIGINS = {"JP", "CN", "KR", "TW"}
 
 _ANILIST_QUERY = """
 query ($search: String) {
-  Page(perPage: 8) {
+  Page(perPage: 10) {
     media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
       id
+      idMal
       format
       seasonYear
       startDate { year }
       endDate { year }
+      episodes
+      duration
+      status
+      isAdult
+      genres
       popularity
       countryOfOrigin
       title { romaji english native }
@@ -1549,8 +1571,14 @@ async def _anilist_search(session, query: str, anilist_key: str = ""):
     return _TMDB_ERROR
 
 
-def _anilist_best_match(results, queries, year, strict: bool):
-    """Pick the AniList entry whose title genuinely matches, or None."""
+def _anilist_best_match(results, queries, year, strict: bool, deep=None):
+    """Pick the AniList entry whose title genuinely matches, or None.
+
+    deep: only /autosort's deep_anime mode passes it (a dict: episode / season / minutes). Then the
+    scored choice of _anilist_best_match_deep() is used and the return value is (media | None, details).
+    Without it (every other caller) the behaviour and the return value are exactly as before."""
+    if deep is not None:
+        return _anilist_best_match_deep(results, queries, year, strict, deep)
     best, best_key = None, None
     for r in (results or [])[:8]:
         if r.get("format") == "MUSIC":
@@ -1837,6 +1865,11 @@ class _Ident(tuple):
     .media_type ("movie" | "tv"); both None when nothing matched."""
     tmdb_id = None
     media_type = None
+    # deep_anime only (see "/autosort deep ANIME identification"): the TMDB match and why it is anime
+    match = None
+    anime_source = None
+    anime_why = ""
+    animelist = None
 
     def __new__(cls, status, kind, animated, tmdb_id=None, media_type=None):
         self = super().__new__(cls, (status, kind, animated))
@@ -1845,7 +1878,7 @@ class _Ident(tuple):
         return self
 
 
-async def _tmdb_identify_core(session, tmdb_key: str, p: dict):
+async def _tmdb_identify_core(session, tmdb_key: str, p: dict, anime_mode: bool = False):
     """-> ("found", kind, animated) | ("none", None, False) | ("error", None, False)
     (an _Ident: that tuple plus .tmdb_id / .media_type).
     `animated` = the TMDB match carries the Animation genre."""
@@ -1877,7 +1910,20 @@ async def _tmdb_identify_core(session, tmdb_key: str, p: dict):
                 animated = TMDB_ANIMATION_GENRE_ID in (match.get("genre_ids") or [])
                 mid = match.get("id")
                 if _is_anime_result(match, media_type):
-                    return _Ident("found", "anime", animated, mid, media_type)
+                    ident = _Ident("found", "anime", animated, mid, media_type)
+                    if anime_mode:
+                        ident.match, ident.anime_source = match, "tmdb"
+                        ident.anime_why = f"animation + {_tmdb_asian_origin(match) or 'ANIME_ALL_ANIMATION'}"
+                    return ident
+                if anime_mode:
+                    # deep_anime: TMDB keywords (japan / samurai / edo period ...) never decide. Anime =
+                    # Animation + Asian origin_country, or the id is in the anime list. Otherwise it is a
+                    # series / movie (the caller may still ask AniList / Jikan).
+                    ok, src, why, listed = await _tmdb_anime_confirm(session, match, media_type, mid, animated)
+                    ident = _Ident("found", "anime" if ok else ("movie" if media_type == "movie" else "series"),
+                                   animated, mid, media_type)
+                    ident.match, ident.anime_source, ident.anime_why, ident.animelist = match, src, why, listed
+                    return ident
                 # Animated title whose original language isn't ja/zh/ko
                 # (e.g. Blue Eye Samurai): ask TMDB's keywords. Movies use the
                 # strict anime-words-only list (live-action manga adaptations
@@ -1893,7 +1939,8 @@ async def _tmdb_identify_core(session, tmdb_key: str, p: dict):
     return _Ident("error" if errored else "none", None, False)
 
 
-async def _tmdb_identify(session, tmdb_key: str, p: dict, use_anilist: bool = False, anilist_key: str = "", info=None):
+async def _tmdb_identify(session, tmdb_key: str, p: dict, use_anilist: bool = False, anilist_key: str = "", info=None,
+                         anime_mode: bool = False):
     """-> ("found", kind) | ("none", None) | ("error", None).
 
     With use_anilist, AniList gets a say ONLY when TMDB is unsure: nothing
@@ -1902,15 +1949,27 @@ async def _tmdb_identify(session, tmdb_key: str, p: dict, use_anilist: bool = Fa
 
     info: optional dict that receives "tmdb_id" / "tmdb_media" of a TMDB match
     (read by /autosort; the result itself is not affected)."""
-    ident = await _tmdb_identify_core(session, tmdb_key, p)
+    ident = await _tmdb_identify_core(session, tmdb_key, p, anime_mode)
     status, kind, animated = ident
     if info is not None and status == "found":
         info["tmdb_id"] = ident.tmdb_id
         info["tmdb_media"] = ident.media_type
+        if anime_mode and ident.match is not None:
+            _anime_tmdb_fields(info, animated, ident.match.get("original_language"),
+                               ",".join(ident.match.get("origin_country") or []), ident.anime_source,
+                               ident.anime_why, ident.animelist)
     if not use_anilist:
         return status, kind
     if status == "found" and not (kind in ("series", "movie") and animated):
         return status, kind           # anime already, or a live-action movie/series
+    if anime_mode:
+        # deep_anime: AniList (Jikan when AniList failed), scored choice + verdict cache
+        res = await _anime_lookup(session, p, anilist_key, True)
+        _anime_note(info, anilist=res["status"])
+        if res["status"] == "found":
+            _anime_note(info, source=res["source"], verdict="anime", **_anime_media_fields(res["media"], res["source"]))
+            return "found", "anime"
+        return status, kind
     a_status, _media = await anilist_identify(session, p, anilist_key)
     if a_status == "found":
         return "found", "anime"
@@ -2213,7 +2272,7 @@ async def tpdb_category(message, mapping, key: str, session=None):
     return target if await tpdb_known(message, key, session) else None
 
 
-async def classify_async(message, session=None, tmdb_key: str = "", use_anilist: bool = False, anilist_key: str = "", openai_key: str = "", info=None, deep_series: bool = False) -> str:
+async def classify_async(message, session=None, tmdb_key: str = "", use_anilist: bool = False, anilist_key: str = "", openai_key: str = "", info=None, deep_series: bool = False, deep_anime: bool = False) -> str:
     """Category for forwarding. Videos are routed to movie / series /
     anime ONLY when TMDB confirms the title; otherwise "unidentified"
     (or "tmdb_error") is returned, which no channel maps to -> skipped.
@@ -2231,6 +2290,13 @@ async def classify_async(message, session=None, tmdb_key: str = "", use_anilist:
     up on TVmaze and then Wikidata with a list of title candidates, and a "series" verdict
     needs a confidence score (see "/autosort deep SERIES identification" at the end of
     this file). It may fill info["series"].
+
+    deep_anime: opt-in, only effective together with deep_series (default False = everything
+    behaves as before). /autosort passes True: anime names are cleaned (groups, dub words, "_Remove"
+    junk, season markers), anime candidates ask AniList (Jikan if AniList failed) BEFORE TMDB with a
+    scored choice, TMDB keywords no longer make a show anime (Animation + Asian origin, the
+    Fribb anime list, or AniList do), and NCOP / NCED / AMV / ... are extras. It may fill info["anime"].
+    See "/autosort deep ANIME identification" at the end of this file.
     """
     early, names, is_files = _early_category(message)
     if early is not None:
@@ -2254,13 +2320,14 @@ async def classify_async(message, session=None, tmdb_key: str = "", use_anilist:
                 return _finish("series")
         return "other"
 
+    anime_mode = bool(deep_anime and deep_series)
     parsed = []
     for i, raw in enumerate(names):
         # The first name (the file name, or - for native videos that have none -
         # the first caption line) is checked for sample / trailer / teaser ...
         # Before this was skipped when there was no file name, so a caption-only
         # "Movie (2025) Official Trailer" was matched to the movie on TMDB.
-        p = _parse_name(raw, check_extra=(i == 0), deep=deep_series)
+        p = _parse_name(raw, check_extra=(i == 0), deep=deep_series, anime=anime_mode)
         if p:
             parsed.append(p)
     if not parsed:
@@ -2285,7 +2352,7 @@ async def classify_async(message, session=None, tmdb_key: str = "", use_anilist:
     try:
         if deep_series:
             return await _deep_series(message, names, parsed, is_files, session, tmdb_key, use_anilist,
-                                      anilist_key, openai_key, {} if info is None else info)
+                                      anilist_key, openai_key, {} if info is None else info, anime_mode)
         errored = False
         for p in parsed:
             status, kind = await _tmdb_identify(session, tmdb_key, p, use_anilist, anilist_key, info)
@@ -3031,7 +3098,7 @@ def _tv_choose(rows, p: dict) -> dict:
     return {"chosen": chosen, "tie": tie, "ambiguous": ambiguous, "lang_ok": lang_ok}
 
 
-async def _tmdb_tv_show(session, tmdb_key: str, p: dict):
+async def _tmdb_tv_show(session, tmdb_key: str, p: dict, anime_mode: bool = False):
     """Identify the SHOW of one parsed name on TMDB with the candidate list.
     -> (entry | None, errored). entry = {"verdict": "found" | "none", "kind": "series" | "anime",
     "id", "facts", "animated", "ambiguous", "lang_ok", "cand", "why", "cacheable"}; None entry
@@ -3071,9 +3138,16 @@ async def _tmdb_tv_show(session, tmdb_key: str, p: dict):
                 lang_ok = None if not p.get("language") else (chosen.get("original_language") == p["language"])
         mid = chosen.get("id")
         animated = TMDB_ANIMATION_GENRE_ID in (chosen.get("genre_ids") or [])
-        kind, why = "series", ""
+        kind, why, a_src, a_list = "series", "", None, None
         if _is_anime_result(chosen, "tv"):
             kind, why = "anime", f"tmdb tv {mid}: animation + original_language={chosen.get('original_language')}"
+            a_src = "tmdb"
+        elif anime_mode:
+            # deep_anime: no keyword rule (it made Blue Eye Samurai anime). Animation + Asian
+            # origin_country, or the anime list.
+            ok, a_src, why2, a_list = await _tmdb_anime_confirm(session, chosen, "tv", mid, animated)
+            if ok:
+                kind, why = "anime", f"tmdb tv {mid}: {why2}"
         elif animated and mid:
             kws = await _tmdb_keywords(session, "tv", mid, tmdb_key)
             if kws is _TMDB_ERROR:
@@ -3094,34 +3168,48 @@ async def _tmdb_tv_show(session, tmdb_key: str, p: dict):
                         p["language"], mid, chosen.get("original_language"))
         return ({"source": "tmdb", "id": mid, "verdict": "found", "kind": kind, "animated": animated,
                  "facts": facts, "ambiguous": ambiguous, "lang_ok": lang_ok, "cand": cand, "why": why,
-                 "cacheable": cacheable}, errored)
+                 "cacheable": cacheable, "anime_source": a_src if kind == "anime" else None, "animelist": a_list,
+                 "tmdb_lang": chosen.get("original_language"),
+                 "tmdb_origin": ",".join(chosen.get("origin_country") or [])}, errored)
     if errored:
         return None, True
     return {"source": "tmdb", "id": None, "verdict": "none", "kind": None, "animated": False, "facts": None,
             "ambiguous": False, "lang_ok": None, "cand": None, "why": "", "cacheable": True}, False
 
 
-async def _deep_tmdb_tv(session, tmdb_key: str, p: dict, use_anilist: bool, anilist_key: str, info: dict) -> dict:
+async def _deep_tmdb_tv(session, tmdb_key: str, p: dict, use_anilist: bool, anilist_key: str, info: dict,
+                        anime_mode: bool = False) -> dict:
     """TMDB (+ AniList when TMDB is unsure) for an episode-like name, deep mode. Same meaning as
     _tmdb_identify(): -> {"status": "found" | "none" | "error", "kind", "entry", "why"}. The show
     verdict is cached per show, so only the first episode of a show searches."""
-    ent, errored = _show_get(p, "tmdb"), False
+    cache_src = "tmdb_a" if anime_mode else "tmdb"     # the two modes reach different verdicts: separate cache entries
+    ent, errored = _show_get(p, cache_src), False
     if ent is None:
-        ent, errored = await _tmdb_tv_show(session, tmdb_key, p)
+        ent, errored = await _tmdb_tv_show(session, tmdb_key, p, anime_mode)
         if ent is not None and ent.get("cacheable"):
-            _show_put(p, "tmdb", ent)
+            _show_put(p, cache_src, ent)
     found = bool(ent and ent["verdict"] == "found")
     status = "found" if found else ("error" if errored and ent is None else "none")
     kind = ent["kind"] if found else None
     why = ent.get("why", "") if found else ""
     if found and info is not None:
         info["tmdb_id"], info["tmdb_media"] = ent["id"], "tv"
+        if anime_mode:
+            _anime_tmdb_fields(info, ent.get("animated"), ent.get("tmdb_lang"), ent.get("tmdb_origin"),
+                               ent.get("anime_source"), ent.get("why") if kind == "anime" else None, ent.get("animelist"))
     if use_anilist and (status != "found" or (kind == "series" and ent.get("animated"))):
-        titles = [c["title"] for c in _cands_of(p) if not c.get("dropped")][:3]
-        a_status, _media = await anilist_identify(
-            session, {"titles": titles, "year": p.get("year"), "weak": p.get("weak", False)}, anilist_key)
-        if a_status == "found":
-            status, kind, why = "found", "anime", "anilist match"
+        if anime_mode:
+            res = await _anime_lookup(session, p, anilist_key, True)
+            _anime_note(info, anilist=res["status"])
+            if res["status"] == "found":
+                status, kind, why = "found", "anime", f"{res['source']} match"
+                _anime_note(info, source=res["source"], verdict="anime", **_anime_media_fields(res["media"], res["source"]))
+        else:
+            titles = [c["title"] for c in _cands_of(p) if not c.get("dropped")][:3]
+            a_status, _media = await anilist_identify(
+                session, {"titles": titles, "year": p.get("year"), "weak": p.get("weak", False)}, anilist_key)
+            if a_status == "found":
+                status, kind, why = "found", "anime", "anilist match"
     return {"status": status, "kind": kind, "entry": ent, "why": why}
 
 
@@ -3473,7 +3561,7 @@ def _score_series(p: dict, tmdb=None, tvmaze=None, openai: bool = False, exact: 
 
 # ---- /autosort entry point: classify_async(..., deep_series=True) ------------------
 async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key: str, use_anilist: bool,
-                       anilist_key: str, openai_key: str, info: dict) -> str:
+                       anilist_key: str, openai_key: str, info: dict, anime_mode: bool = False) -> str:
     """The deep series pipeline behind classify_async(deep_series=True). Returns the
     usual category strings; "series" is only returned when _score_series() agrees.
     Everything else that looked like a series becomes "other" (never dropped).
@@ -3521,16 +3609,32 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
             runtime=next((f["runtime"] for f in (tmdb, tvmaze) if f and f.get("runtime")), None))
         return _finish("series") if ok else "other"
 
+    # 0) deep_anime only: an anime CANDIDATE asks AniList (Jikan when AniList failed) BEFORE TMDB
+    if anime_mode:
+        ap0 = first.get("anime") or {}
+        _anime_note(info, candidate=bool(ap0.get("candidate")), signals=list(ap0.get("signals") or []),
+                    title=ap0.get("title") or first.get("clean_title") or first["titles"][0],
+                    language=first.get("language") or ap0.get("language"),
+                    season=first.get("season") or ap0.get("season"),
+                    episode=first.get("episode") or ap0.get("episode"),
+                    source="-", verdict=None, anilist="-")
+        if await _anime_first_pass(session, parsed, use_anilist, anilist_key, minutes, info):
+            src = info["anime"].get("source") or "anilist"
+            sinfo["reason"] = f"{src}: anime (asked before TMDB)"
+            if sinfo["looked_series"]:
+                sinfo["to_anime"] = f"{src} match (anime candidate, asked before TMDB)"
+            return _finish("anime")
+
     # 1) TMDB (+ AniList inside, only when TMDB is unsure). Episode-like names use the deep
     #    show matcher (candidates, language, per-show cache); everything else is unchanged.
     found, errored = None, False
     for p in parsed:
         hit = None
         if p.get("is_episode") or p.get("series_like"):
-            hit = await _deep_tmdb_tv(session, tmdb_key, p, use_anilist, anilist_key, info)
+            hit = await _deep_tmdb_tv(session, tmdb_key, p, use_anilist, anilist_key, info, anime_mode)
             status, kind = hit["status"], hit["kind"]
         else:
-            status, kind = await _tmdb_identify(session, tmdb_key, p, use_anilist, anilist_key, info)
+            status, kind = await _tmdb_identify(session, tmdb_key, p, use_anilist, anilist_key, info, anime_mode)
         if status == "found":
             found = (p, kind, hit)
             break
@@ -3538,6 +3642,8 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
             errored = True
     if found:
         p, kind, hit = found
+        if anime_mode and kind != "anime":
+            await _anime_downgrade_note(session, tmdb_key, info)
         if kind != "series":                       # movie / anime: decided exactly as before
             sinfo["reason"] = f"tmdb: {kind}"
             if kind == "anime" and sinfo["looked_series"]:
@@ -3591,3 +3697,865 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
         sinfo["reason"] = f"openai: {verdict}"
         return verdict
     return await _decide(p, "fallback")
+
+
+# ============================================================
+# /autosort deep ANIME identification + anime gate settings
+# ============================================================
+# Opt-in: classify_async(..., deep_series=True, deep_anime=True). Only handlers/autosort.py
+# passes both, so /fwd, /autosortai, matches_async() and the /settings AniList buttons
+# (anilist_lookup / anilist_identify) behave exactly as before.
+#
+# What deep_anime changes (and only then):
+#   1. Names are cleaned for anime (_anime_info): fansub / release groups, "_Remove" junk,
+#      audio / codec / language brackets, quality words and dub words leave the title (dub words
+#      become a language signal), season / part / cour markers are split off. Anime lookups
+#      use two title candidates only: the cleaned title and the same title without season
+#      markers - never progressive word-dropping ("My Hero").
+#   2. A file is an anime CANDIDATE when it has a fansub / known anime release group, a dub /
+#      dual-audio / Indian-language signal together with an episode marker, or anime-style
+#      naming (anime_tag / anime_hint). Candidates ask AniList FIRST (when the user enabled
+#      AniList), then TMDB. Everything else keeps the old order (TMDB first, AniList second
+#      only when TMDB is unsure).
+#   3. AniList is asked with a stronger query and a scored choice (_anilist_best_match_deep).
+#      If AniList FAILED (not "not found") Jikan (MyAnimeList, no key) answers instead.
+#   4. TMDB keywords NEVER make a show anime any more (the old rule turned Blue Eye Samurai
+#      into anime: its keywords are japan / samurai / edo period). A TMDB match is anime when
+#      it is Animation + an Asian origin, OR its id is in the Fribb anime-lists data set, OR
+#      AniList / Jikan confirm it. A live-action match is never anime.
+#   5. NCOP / NCED / creditless / AMV / PV / CM / preview / opening / ending / menu / bonus
+#      files are extras ("other"), even for anime.
+#
+# Env vars (all optional):
+#   USE_ANIME_LISTS=1     second opinion from Fribb/anime-lists (a TMDB id in the list = anime)
+#   USE_JIKAN=1           Jikan answers when AniList FAILED (never as an extra vote)
+#   ANIME_GROUPS=         extra anime release groups, comma separated (added to the built-in list)
+#   ANIME_MIN_MINUTES=3 / ANIME_MAX_MINUTES=300      anime gate length band (handlers/autosort.py)
+#   ANIME_THUMB_RATIO_MIN=1.30 / ANIME_THUMB_RATIO_MAX=2.40   anime gate thumbnail band
+#   ANIME_RATIO_UNKNOWN=other   "other" | "allow": no thumbnail size at all
+#   ANIME_REQUIRE_THUMB=1       a video / document with NO thumbnail goes to Other
+USE_ANIME_LISTS = os.environ.get("USE_ANIME_LISTS", "1").strip().lower() not in ("0", "false", "no")
+USE_JIKAN = os.environ.get("USE_JIKAN", "1").strip().lower() not in ("0", "false", "no")
+
+ANIME_MIN_MINUTES = max(0.0, _env_float("ANIME_MIN_MINUTES", 3.0))
+ANIME_MAX_MINUTES = _env_float("ANIME_MAX_MINUTES", 300.0)
+if ANIME_MAX_MINUTES <= ANIME_MIN_MINUTES:
+    logger.warning("ANIME_MIN_MINUTES/MAX (%s / %s) are not a valid range - using 3 / 300",
+                   ANIME_MIN_MINUTES, ANIME_MAX_MINUTES)
+    ANIME_MIN_MINUTES, ANIME_MAX_MINUTES = 3.0, 300.0
+
+ANIME_THUMB_RATIO_MIN = _env_float("ANIME_THUMB_RATIO_MIN", _DEFAULT_THUMB_RATIO_MIN)
+ANIME_THUMB_RATIO_MAX = _env_float("ANIME_THUMB_RATIO_MAX", _DEFAULT_THUMB_RATIO_MAX)
+if not 0 < ANIME_THUMB_RATIO_MIN < ANIME_THUMB_RATIO_MAX:
+    logger.warning("ANIME_THUMB_RATIO_MIN/MAX (%s / %s) are not a valid range - using %s / %s",
+                   ANIME_THUMB_RATIO_MIN, ANIME_THUMB_RATIO_MAX, _DEFAULT_THUMB_RATIO_MIN, _DEFAULT_THUMB_RATIO_MAX)
+    ANIME_THUMB_RATIO_MIN, ANIME_THUMB_RATIO_MAX = _DEFAULT_THUMB_RATIO_MIN, _DEFAULT_THUMB_RATIO_MAX
+
+ANIME_RATIO_UNKNOWN = os.environ.get("ANIME_RATIO_UNKNOWN", "other").strip().lower()
+if ANIME_RATIO_UNKNOWN not in ("other", "allow"):
+    ANIME_RATIO_UNKNOWN = "other"
+
+# A video / document without any thumbnail (blank preview) is not a proper anime episode.
+ANIME_REQUIRE_THUMB = os.environ.get("ANIME_REQUIRE_THUMB", "1").strip().lower() not in ("0", "false", "no")
+
+
+# ---- anime name cleaning --------------------------------------------------------------------
+# Release groups that only ever publish anime (alphanumerics only, lower case). A hyphenated
+# group ("JUDAS-LUMiX") counts when any of its parts is in the set. Add more with ANIME_GROUPS.
+_ANIME_GROUPS = {
+    "subsplease", "erairaws", "horriblesubs", "judas", "commie", "ember", "asw", "tsundereraws", "ohysraws",
+    "animetime", "kekkai", "coalgirls", "gjm", "doki", "utw", "hiryuu", "yameii", "dkb", "animeland", "chihiro",
+    "naisu", "sokudo", "toonshub", "lostyears", "lolihouse", "moozzi2", "nekomoe", "bonkai77", "dragsterps",
+    "sallysubs", "reaktor", "yuisubs", "cleo", "mtbb",
+}
+for _g in os.environ.get("ANIME_GROUPS", "").split(","):
+    _g = re.sub(r"[^a-z0-9]", "", _g.lower())
+    if _g:
+        _ANIME_GROUPS.add(_g)
+
+_ANIME_JUNK_SUFFIX_RE = re.compile(r"(?:_+|\s+-\s+)(?:remove[d]?|removed?[\s._-]?ads?)\s*$", re.IGNORECASE)
+# a fansub / release group glued to a technical tag: "...SubS-Me7alh", "...x265-GROUP"
+_ANIME_TAIL_GROUP_RE = re.compile(
+    r"(?:x26[45]|h[\s.]?26[45]|hevc|avc|av1|10bit|\d{3,4}p|blu[\s._-]?ray|web[\s._-]?dl|web[\s._-]?rip|hdtv|"
+    r"aac[\s._]?\d?|ddp?[\s._]?\d?|opus|flac|subs?)[\s._]*-\s*([A-Za-z0-9]{2,20})\s*(?=$|[\s(\[-])", re.IGNORECASE)
+_ANIME_BARE_SEASON_RE = re.compile(r"(?<![A-Za-z0-9])s0*\d{1,2}(?![A-Za-z0-9])", re.IGNORECASE)
+_ANIME_DASH_EP_RE = re.compile(r"^0*(\d{1,4})(?:v\d)?(?![A-Za-z0-9])")
+_ANIME_YEAR_RE = re.compile(r"(?<![0-9])((?:19|20)\d{2})(?![0-9])")
+_ANIME_DUB_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:dubbed|dub|dual[\s._-]?audio|multi[\s._-]?audio)(?![A-Za-z0-9])", re.IGNORECASE)
+_ANIME_DUB_WORDS = {"dubbed", "dub", "dual", "multi", "audio"}      # may sit at a title edge ...
+_ANIME_DUB_REAL = {"dubbed", "dub"}                                 # ... but only these (or "dual / multi AUDIO") prove a dub
+_ANIME_SUB_WORDS = {"subbed", "sub", "subs", "esub", "esubs", "hsub", "hsubs", "msub", "msubs", "org", "original"}
+_ANIME_EN_WORDS = {"english", "eng", "japanese", "jap", "jpn"}
+
+# Season / part / cour markers at the END of a title: "Season 2", "2nd Season", "S02", "Part 2",
+# "Cour 2", "Final Season", roman numerals II / III / IV. Needs a separator in front, so "Hawaii" stays.
+_SEASON_WORDS_RE = re.compile(
+    r"(?:^|[\s:\-–—,]+)(?:"
+    r"(?:the\s+)?final\s+season"
+    r"|season\s*0*(?P<s1>\d{1,2})"
+    r"|0*(?P<s2>\d{1,2})(?:st|nd|rd|th)\s+season"
+    r"|s0*(?P<s3>\d{1,2})"
+    r"|part\s*0*(?P<p1>\d{1,2})"
+    r"|cour\s*0*(?P<p2>\d{1,2})"
+    r"|(?P<r>iii|ii|iv)"
+    r")\s*$", re.IGNORECASE)
+_ROMAN_SEASON = {"ii": 2, "iii": 3, "iv": 4}
+
+
+def _strip_season_words(text: str):
+    """(title without trailing season / part / cour markers, season number | None, part | None).
+    Never strips a title down to nothing."""
+    cur, season, part = (text or "").strip(), None, None
+    for _ in range(3):
+        m = _SEASON_WORDS_RE.search(cur)
+        if not m:
+            break
+        rest = cur[:m.start()].rstrip(" :-–—,")
+        if len(re.findall(r"[A-Za-z0-9]", rest)) < 2:
+            break
+        s = m.group("s1") or m.group("s2") or m.group("s3")
+        if m.group("r"):
+            s = _ROMAN_SEASON[m.group("r").lower()]
+        if s and season is None:
+            season = int(s)
+        pp = m.group("p1") or m.group("p2")
+        if pp and part is None:
+            part = int(pp)
+        cur = rest
+    return cur, season, part
+
+
+def _anime_strip_edges(title: str):
+    """(title without LEADING / TRAILING dub and language words, language codes, dub flag).
+    Dub words (Dubbed, Dub, Dual Audio, Multi) and Indian language words (Hindi, Tamil ...) are
+    removed from the title edges and kept as a signal. A lone "English" / "Japanese" is a real
+    title word and stays; "English Dub" goes."""
+    langs, state = [], {"dub": False}
+
+    def is_edge(tok):
+        a = _alnum(tok)
+        return a in _ANIME_DUB_WORDS or a in _ANIME_SUB_WORDS or a in _LANG_FULL or a in _ANIME_EN_WORDS
+
+    def trim(seq, from_end):
+        n, i = len(seq), 0
+        while i < n and is_edge(seq[n - 1 - i] if from_end else seq[i]):
+            i += 1
+        if i == 0 or i >= n:                      # nothing to strip / the whole title would vanish
+            return seq
+        run = seq[n - i:] if from_end else seq[:i]
+        words = {_alnum(t) for t in run}
+        proof = bool(words & _ANIME_DUB_REAL or words & set(_LANG_FULL) or ({"dual", "multi"} & words and "audio" in words))
+        if not proof:
+            return seq                            # "Dual Survival", a lone English / Japanese: part of the title
+        for t in run:
+            a = _alnum(t)
+            if a in _LANG_FULL:
+                langs.append(_LANG_FULL[a])
+            elif a in ("english", "eng") and "en" not in langs:
+                langs.append("en")
+        state["dub"] = True
+        return seq[:n - i] if from_end else seq[i:]
+
+    toks = title.split()
+    toks = trim(toks, True)
+    toks = trim(toks, False)
+    return " ".join(toks), langs, state["dub"]
+
+
+def _known_anime_group(group: str) -> bool:
+    if not group:
+        return False
+    if re.sub(r"[^a-z0-9]", "", group.lower()) in _ANIME_GROUPS:
+        return True
+    return any(re.sub(r"[^a-z0-9]", "", part.lower()) in _ANIME_GROUPS for part in re.split(r"[-_\s.]+", group))
+
+
+def _anime_info(name: str) -> dict:
+    """Pure anime clean-up of one release name (no network). `name` is the name BEFORE the deep
+    normaliser (which deletes audio-only brackets such as "[Dual Audio]" - exactly the signal wanted).
+
+      title        cleaned title: no groups, brackets, quality / source / codec words, no dub words
+      titles       [cleaned title, same without season / part / cour markers]  (deduplicated)
+      language     "hi" / "ta" / "te" ... / "en" (English dub) from dub words and audio brackets, else None
+      dub          a dub / dual-audio / Indian-language signal was seen
+      fansub       leading [Group] (SubsPlease, Erai-raws ...)       groups  trailing release groups
+      known_group  one of them is a known anime-only group           season / part / episode / year
+    Episode forms: S03E14, E1090, EP12, Episode 12, 1x05 and the fansub style "Title - 12"."""
+    out = {"title": "", "titles": [], "language": None, "dub": False, "fansub": None, "groups": [],
+           "known_group": False, "season": None, "part": None, "episode": None, "year": None,
+           "has_episode": False, "junk": False}
+    stem = _VIDEO_EXT_END_RE.sub("", name or "").strip()
+    cleaned = _ANIME_JUNK_SUFFIX_RE.sub("", stem)
+    if cleaned != stem:
+        out["junk"], stem = True, cleaned
+    if not stem:
+        return out
+    out["fansub"] = _fansub_group(stem)
+
+    langs, dub = [], bool(_ANIME_DUB_RE.search(stem))
+    groups = []
+    for m in _BRACKET_GROUP_RE.finditer(stem):
+        inner = m.group(1).strip()
+        if not inner:
+            continue
+        tokens = [t for t in re.split(r"[\s._\-+,;/|&:]+", inner) if t]
+        at_end = not re.sub(r"[\s._\-–—]+", "", stem[m.end():])
+        if re.fullmatch(r"(?:19|20)\d{2}", inner):
+            out["year"] = out["year"] or int(inner)
+        elif re.fullmatch(r"[0-9A-Fa-f]{8}", inner):
+            continue                                          # CRC32
+        else:
+            codes = _lang_codes(tokens, short=False)
+            for c in codes:
+                if c not in langs:
+                    langs.append(c)
+            if codes or any(_alnum(t) in ("dual", "multi") for t in tokens):
+                dub = True
+            looks_like_group = (re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)*", inner)
+                                and len(inner) >= 3 and not codes
+                                and not any(_TECH_TOKEN_RE.match(t) or _AUDIO_FRAG_RE.match(t) for t in tokens))
+            if at_end and looks_like_group and inner != out["fansub"]:
+                groups.append(inner)
+    mt = _ANIME_TAIL_GROUP_RE.search(stem)
+    if mt and mt.group(1) not in groups and _alnum(mt.group(1)) not in _LANG_ANY:
+        groups.append(mt.group(1))
+    out["groups"] = groups
+    out["known_group"] = any(_known_anime_group(g) for g in groups) or _known_anime_group(out["fansub"] or "")
+
+    text = stem
+    for _ in range(3):                                        # inner groups first, then the shell left behind
+        new = _BRACKET_GROUP_RE.sub(" ", text)
+        if new == text:
+            break
+        text = new
+    spaced = re.sub(r"\s{2,}", " ", _spaced(text)).strip()
+    segs = [s.strip() for s in re.split(r"\s+[-–—]\s+", spaced) if s.strip()]
+    if not segs:
+        return out
+
+    # episode / season numbers: S03E14, 1x05, Episode 12, E1090, a bare S02 ... else "Title - 12"
+    season, episode = None, None
+    m = (re.search(r"(?<![A-Za-z0-9])s0*(\d{1,2})[ ._-]?e0*(\d{1,4})(?![0-9])", spaced, re.IGNORECASE)
+         or re.search(r"(?<![A-Za-z0-9])(\d{1,2})x0*(\d{1,3})(?![A-Za-z0-9])", spaced, re.IGNORECASE))
+    if m:
+        season, episode = int(m.group(1)), int(m.group(2))
+    else:
+        m = re.search(r"(?<![A-Za-z0-9])(?:(?:episodes?|ep|epi)\.?[\s._#:-]*0*(\d{1,4})|e0*(\d{2,4}))(?![A-Za-z0-9])",
+                      spaced, re.IGNORECASE)
+        if m:
+            episode = int(m.group(1) or m.group(2))
+        m = _ANIME_BARE_SEASON_RE.search(segs[0])
+        if m:
+            season = int(re.sub(r"\D", "", m.group(0)))
+    if episode is None:
+        for seg in segs[1:]:
+            m = _ANIME_DASH_EP_RE.match(seg)
+            if m:
+                n = int(m.group(1))
+                if not (len(m.group(1)) == 4 and 1900 <= n <= 2099):      # a year is not an episode
+                    episode = n
+                    break
+    out["episode"] = episode
+    out["has_episode"] = episode is not None or bool(_DEEP_EP_RE.search(spaced))
+
+    # the title is the first segment, cut at the first episode / season designator / technical tag
+    head = segs[0]
+    cut = len(head)
+    for rx in (_DEEP_EP_RE, _ANIME_BARE_SEASON_RE, _TECH_START_RE):
+        for m in rx.finditer(head):
+            if m.start() > 0:
+                cut = min(cut, m.start())
+                break
+    title = re.sub(r"^[\s\-–—_:|~.,]+|[\s\-–—_:|~.,]+$", "", head[:cut])
+    # the year, when the name has one outside brackets ("Your.Name.2016.1080p")
+    if out["year"] is None:
+        m = _ANIME_YEAR_RE.search(spaced)
+        if m and m.start() > 0:
+            out["year"] = int(m.group(1))
+
+    title, edge_langs, edge_dub = _anime_strip_edges(title)
+    dub = dub or edge_dub
+    # language words AFTER the title ("Doraemon S01E10 Hindi Dubbed 720p"): the tail of the first segment
+    # and the other segments
+    tail = " ".join([head[cut:]] + segs[1:])
+    for c in _lang_codes(_tokens(tail), short=False):
+        if c not in langs:
+            langs.append(c)
+    if re.search(r"(?<![A-Za-z0-9])(?:english|eng)[\s._-]*dub(?:bed)?(?![A-Za-z0-9])", stem, re.IGNORECASE) and "en" not in langs:
+        langs.append("en")
+    for c in edge_langs:
+        if c not in langs:
+            langs.insert(0, c)
+    out["dub"] = dub
+    indian = [c for c in langs if c != "en"]
+    out["language"] = indian[0] if indian else (langs[0] if langs else None)
+    if len(indian) > 1 and not edge_langs:
+        out["language"] = None                                # several audio tracks: not one language
+
+    if len(re.findall(r"[A-Za-z0-9]", title)) < 2 or _generic_title(title):
+        return out
+    stripped, s_season, s_part = _strip_season_words(title)
+    out["season"] = season if season is not None else s_season
+    out["part"] = s_part
+    out["title"] = title
+    titles = [title]
+    if stripped and _norm_cmp(stripped) != _norm_cmp(title) and not _generic_title(stripped):
+        titles.append(stripped)
+    out["titles"] = titles
+    return out
+
+
+# unambiguous anime extras: always "other" in deep_anime mode
+_ANIME_EXTRA_SURE_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:nc[\s._-]?(?:op|ed)\d*|(?:non|no)[\s._-]?credit(?:s|ed)?|creditless|textless|"
+    r"clean[\s._-]?(?:op|ed|opening|ending)\d*|amv|anime[\s._-]?music[\s._-]?video)(?![A-Za-z0-9])", re.IGNORECASE)
+# contextual words: only for a file that already looks like anime (a movie called "The Ending" is no extra)
+_ANIME_EXTRA_CTX_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:pv[\s._-]?\d{0,2}|cm[\s._-]?\d{0,2}|preview|(?:op|ed)[\s._-]?\d{1,2}(?:v\d)?)(?![A-Za-z0-9])",
+    re.IGNORECASE)
+_ANIME_EXTRA_LOOSE_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:opening|ending|menu|bonus|extras?|special[\s._-]?features?)(?![A-Za-z0-9])", re.IGNORECASE)
+
+
+def _anime_extra(stem: str, anime_like: bool, has_marker: bool) -> bool:
+    """NCOP / NCED / creditless / AMV always; PV / CM / preview / OP1 / ED2 when the file looks like
+    anime; opening / ending / menu / bonus when it looks like anime AND has no episode marker
+    ("Show S01E05 - The Opening" is an episode). A hit as the very first word of the name does not
+    count unless a dash follows (same rule as _deep_extra())."""
+    def hit(rx):
+        for m in rx.finditer(stem):
+            if m.start() > 0 or re.match(r"\s*[-–—:|]", stem[m.end():]):
+                return True
+        return False
+    if hit(_ANIME_EXTRA_SURE_RE):
+        return True
+    if anime_like and hit(_ANIME_EXTRA_CTX_RE):
+        return True
+    return bool(anime_like and not has_marker and hit(_ANIME_EXTRA_LOOSE_RE))
+
+
+def _anime_attach(p: dict, raw_name: str, check_extra: bool) -> None:
+    """Deep-anime part of _parse_name(): adds p["anime"], flags anime extras and - for a STRONG anime
+    candidate - swaps the TMDB title candidates for the cleaned anime ones (cleaned title, and the
+    same without season markers; no "<title> Hindi", no progressive shortening)."""
+    a = _anime_info(raw_name)
+    signals = []
+    if p.get("anime_tag"):
+        signals.append("tag")
+    serial_style = bool(p.get("platforms") or p.get("date_episode"))
+    own_hint = bool(a["has_episode"] and not serial_style and (
+        (a["season"] is None and not p.get("season")) or len(a["titles"]) > 1))
+    if a["fansub"]:
+        signals.append("fansub:" + a["fansub"])
+    elif p.get("anime_hint") or own_hint:
+        signals.append("hint")
+    if a["known_group"]:
+        signals.append("group:" + (next((g for g in a["groups"] if _known_anime_group(g)), None) or a["fansub"] or "?"))
+    has_ep = bool(a["has_episode"] or p.get("strong_episode"))
+    if a["dub"] and has_ep:
+        signals.append("dub+ep")
+    strong = bool(p.get("anime_tag") or a["fansub"] or a["known_group"] or (a["dub"] and has_ep))
+    a["signals"], a["candidate"], a["strong"] = signals, bool(signals), strong
+    p["anime"] = a
+
+    if check_extra and not p["extra"]:
+        anime_like = bool(signals) or bool(re.search(r"(?<![A-Za-z0-9])anime(?![A-Za-z0-9])", raw_name, re.IGNORECASE))
+        stem = _VIDEO_EXT_END_RE.sub("", raw_name)
+        if _anime_extra(stem, anime_like, has_ep):
+            p["extra"] = True
+    if a["language"] and not p.get("language"):
+        p["language"] = a["language"]
+    if strong and a["titles"] and not p.get("regional"):
+        titles = [t for t in a["titles"] if not _generic_title(t)]
+        if titles:
+            p["titles"] = titles
+            p["candidates"] = [{"title": t, "dropped": 0, "kind": "anime"} for t in titles]
+            p["clean_title"] = titles[0]
+
+
+# ---- AniList: scored choice (deep_anime) -----------------------------------------------------------
+_ANILIST_EP_FORMATS = {"TV", "TV_SHORT", "ONA", "OVA", "SPECIAL"}
+
+
+def _anime_score(q: str, n: str) -> float:
+    """Title similarity of two normalised titles, rapidfuzz when installed (else difflib); the digit
+    rule of _title_score() is kept ("Mob Psycho 100" never matches "Mob Psycho 200")."""
+    if not q or not n:
+        return 0.0
+    if q == n:
+        return 1.0
+    if _DIGITS.findall(q) != _DIGITS.findall(n):
+        return 0.0
+    return _sim(q, n)
+
+
+def _anilist_best_match_deep(results, queries, year, strict: bool, ctx: dict):
+    """The deep_anime choice among AniList results -> (media | None, details dict).
+
+    Title score is computed on the BASE titles (season / part / cour words removed from both
+    sides), so "My Hero Academia" can reach "Boku no Hero Academia 3rd Season"; which season it is
+    is decided by the preference below, not by the fuzzy score. Hard filters: MUSIC format, origin
+    outside ANILIST_ORIGINS, a score below MIN_TITLE_SCORE (1.0 and ANILIST_STRICT_MIN_POPULARITY
+    for weak names), a file year outside the show's years. Ranking, in this order: exact normalised
+    title, title score, format (episode marker -> TV / TV_SHORT / ONA / OVA / SPECIAL; a year and no
+    episode marker -> MOVIE), season (the file's season number vs a "2nd Season" / "Season 3" / "III"
+    marker in the entry's titles or synonyms), popularity. The file length vs the entry's episode
+    length is only reported, never a veto."""
+    qs = []
+    for q in queries:
+        if q:
+            qs.append((q, _strip_season_words(q)[0] or q))
+    has_ep, fseason, minutes = bool(ctx.get("episode")), ctx.get("season"), ctx.get("minutes")
+    best, best_key, best_d = None, None, None
+    for r in (results or [])[:10]:
+        fmt = r.get("format")
+        if fmt == "MUSIC":
+            continue
+        if (r.get("countryOfOrigin") or "JP") not in ANILIST_ORIGINS:
+            continue
+        t = r.get("title") or {}
+        names = [t.get("romaji"), t.get("english"), t.get("native")] + list(r.get("synonyms") or [])
+        score, exact, seasons = 0.0, False, set()
+        for n in names:
+            if not n or not isinstance(n, str):
+                continue
+            nn = _norm_cmp(n)
+            nb, ns, _np = _strip_season_words(nn)
+            nb = nb or nn
+            if ns is not None:
+                seasons.add(ns)
+            for q, qb in qs:
+                s = _anime_score(qb, nb)
+                if s > score:
+                    score = s
+                if qb and qb == nb:
+                    exact = True
+        if score < (1.0 if strict else MIN_TITLE_SCORE):
+            continue
+        pop = r.get("popularity") or 0
+        if strict and pop < ANILIST_STRICT_MIN_POPULARITY:
+            continue
+        if year:
+            if fmt == "MOVIE":
+                ry = r.get("seasonYear") or ((r.get("startDate") or {}).get("year"))
+                if ry and abs(ry - year) > 1:
+                    continue
+            else:
+                sy = (r.get("startDate") or {}).get("year") or r.get("seasonYear")
+                ey = (r.get("endDate") or {}).get("year") or (datetime.date.today().year + 1)
+                if sy and (year < sy - 1 or year > ey + 1):
+                    continue
+        if has_ep:
+            fmt_pref = 1 if fmt in _ANILIST_EP_FORMATS else 0
+        elif year:
+            fmt_pref = 1 if fmt == "MOVIE" else 0
+        else:
+            fmt_pref = 0
+        if fseason and fseason >= 2:
+            season_pref = 2 if fseason in seasons else (-1 if seasons else 0)
+        else:
+            season_pref = 1 if not seasons else 0
+        key = (1 if exact else 0, round(score, 4), fmt_pref, season_pref, pop)
+        if best is None or key > best_key:
+            dur, note = r.get("duration"), None
+            if minutes and isinstance(dur, (int, float)) and dur > 0:
+                note = f"file {minutes:.0f}m vs entry {dur:.0f}m per episode"
+            best, best_key = r, key
+            best_d = {"score": round(score, 3), "exact": exact, "format_pref": fmt_pref, "season_pref": season_pref,
+                      "dur": note}
+    return best, (best_d or {})
+
+
+# ---- Jikan (MyAnimeList, free, no key): used ONLY when AniList FAILED ---------------------------------
+JIKAN_URL = "https://api.jikan.moe/v4/anime"
+JIKAN_TIMEOUT_SECONDS = 8
+JIKAN_RETRIES = 3
+JIKAN_MIN_INTERVAL = 1.0            # Jikan allows ~3 requests / second and 60 / minute: one per second
+JIKAN_DOWN_SECONDS = 30             # after a failed call skip Jikan this long (a dead Jikan must not slow a run)
+_JIKAN_CACHE: "OrderedDict" = OrderedDict()      # normalized query -> normalized results
+_jikan_lock = None
+_jikan_last_call = 0.0
+_jikan_down_until = 0.0
+_JIKAN_FORMATS = {"TV": "TV", "Movie": "MOVIE", "OVA": "OVA", "ONA": "ONA", "Special": "SPECIAL",
+                  "TV Special": "SPECIAL", "Music": "MUSIC", "CM": "MUSIC", "PV": "MUSIC"}
+
+
+def _jikan_minutes(text):
+    """"24 min per ep" -> 24, "1 hr 50 min" -> 110, anything else -> None."""
+    if not isinstance(text, str):
+        return None
+    h = re.search(r"(\d+)\s*hr", text)
+    m = re.search(r"(\d+)\s*min", text)
+    total = (int(h.group(1)) * 60 if h else 0) + (int(m.group(1)) if m else 0)
+    return total or None
+
+
+def _jikan_media(d):
+    """One Jikan entry in the AniList media shape (so one scorer serves both). MAL has no country
+    of origin: it is a Japanese anime database, so every entry counts as "JP"."""
+    if not isinstance(d, dict) or not d.get("mal_id"):
+        return None
+    aired = d.get("aired") or {}
+    sy = _year_of(aired.get("from")) or _as_int(d.get("year"))
+    ey = _year_of(aired.get("to"))
+    synonyms = list(d.get("title_synonyms") or [])
+    synonyms += [t.get("title") for t in (d.get("titles") or []) if isinstance(t, dict) and t.get("title")]
+    return {
+        "id": d["mal_id"], "idMal": d["mal_id"], "format": _JIKAN_FORMATS.get(d.get("type") or "TV", "TV"),
+        "seasonYear": sy, "startDate": {"year": sy}, "endDate": {"year": ey},
+        "popularity": d.get("members") or 0, "countryOfOrigin": "JP",
+        "title": {"romaji": d.get("title"), "english": d.get("title_english"), "native": d.get("title_japanese")},
+        "synonyms": synonyms, "episodes": d.get("episodes"), "duration": _jikan_minutes(d.get("duration")),
+        "status": d.get("status"), "isAdult": str(d.get("rating") or "").startswith("Rx"),
+        "genres": [g.get("name") for g in (d.get("genres") or []) if isinstance(g, dict)],
+    }
+
+
+async def _jikan_search(session, query: str):
+    """List of AniList-shaped media ([] = nothing found) or _TMDB_ERROR. Never raises. One request at
+    a time, JIKAN_MIN_INTERVAL apart; 429 -> Retry-After; 8 s timeout."""
+    global _jikan_lock, _jikan_last_call, _jikan_down_until
+    if aiohttp is None or session is None:
+        return _TMDB_ERROR
+    ck = _norm_cmp(query)
+    hit = _JIKAN_CACHE.get(ck)
+    if hit is not None:
+        _JIKAN_CACHE.move_to_end(ck)
+        return hit
+    loop = asyncio.get_event_loop()
+    if loop.time() < _jikan_down_until:
+        return _TMDB_ERROR
+    if _jikan_lock is None:
+        _jikan_lock = asyncio.Lock()
+    for attempt in range(JIKAN_RETRIES):
+        async with _jikan_lock:
+            wait = JIKAN_MIN_INTERVAL - (loop.time() - _jikan_last_call)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            try:
+                async with session.get(
+                    JIKAN_URL, params={"q": query, "limit": 5},
+                    timeout=aiohttp.ClientTimeout(total=JIKAN_TIMEOUT_SECONDS),
+                ) as resp:
+                    _jikan_last_call = loop.time()
+                    if resp.status == 429:
+                        try:
+                            retry = int(resp.headers.get("Retry-After", 3))
+                        except (TypeError, ValueError):
+                            retry = 3
+                        await asyncio.sleep(min(max(retry, 1), 30))
+                        continue
+                    if resp.status >= 500:
+                        await asyncio.sleep(1 + attempt)
+                        continue
+                    if resp.status != 200:
+                        break
+                    data = await resp.json()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug("Jikan lookup failed for %r: %s", query, e)
+                await asyncio.sleep(1 + attempt)
+                continue
+        rows = data.get("data") if isinstance(data, dict) else None
+        results = [m for m in (_jikan_media(d) for d in (rows or [])) if m]
+        _JIKAN_CACHE[ck] = results
+        if len(_JIKAN_CACHE) > _CACHE_MAX:
+            _JIKAN_CACHE.popitem(last=False)
+        return results
+    _jikan_down_until = loop.time() + JIKAN_DOWN_SECONDS
+    return _TMDB_ERROR
+
+
+# ---- Fribb/anime-lists: a TMDB id in this list is anime (deterministic second opinion) -------------
+# https://github.com/Fribb/anime-lists  anime-list-full.json. Verified against the repository README:
+# each entry has "type" (TV / MOVIE / OVA ...), "anilist_id", "mal_id", "anidb_id", "tvdb_id", "season"
+# and "themoviedb_id" as an OBJECT: {"tv": 44298} or {"movie": [128]} (tv = one id, movie = a list).
+# TMDB ids are NOT unique across movie and TV (tv/25 is Star Wars Droids, movie/25 is Jarhead), so the
+# table is keyed (media, id), never by the bare id. An entry typed MOVIE can sit under "tv" (hack//G.U.
+# Trilogy), so the object's own key decides the media, not "type".
+ANIME_LIST_URL = "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json"
+ANIME_LIST_TIMEOUT_SECONDS = 60
+ANIME_LIST_RETRY_SECONDS = 1800      # after a failed download try again after this long (not on every file)
+_ANIME_LIST = None                   # {(media, tmdb id): (anilist_id, mal_id, type)} once loaded
+_anime_list_lock = None
+_anime_list_retry_at = 0.0
+
+
+def _anime_list_tmdb_ids(entry: dict) -> list:
+    """[("tv" | "movie", id), ...] of one list entry; tolerates a bare id / list (older shapes)."""
+    tm = entry.get("themoviedb_id")
+    out = []
+    if isinstance(tm, dict):
+        for media in ("tv", "movie"):
+            v = tm.get(media)
+            for x in (v if isinstance(v, (list, tuple)) else [v]):
+                i = _as_int(x)
+                if i:
+                    out.append((media, i))
+    elif tm not in (None, "", []):
+        media = "movie" if str(entry.get("type") or "").upper() == "MOVIE" else "tv"
+        for x in (tm if isinstance(tm, (list, tuple)) else [tm]):
+            i = _as_int(x)
+            if i:
+                out.append((media, i))
+    return out
+
+
+def _anime_list_build(raw) -> dict:
+    data = json.loads(raw)
+    if not isinstance(data, list):
+        raise ValueError("anime-list-full.json is not a list")
+    table, entries = {}, 0
+    for e in data:
+        if not isinstance(e, dict):
+            continue
+        entries += 1
+        ids = _anime_list_tmdb_ids(e)
+        if not ids:
+            continue
+        val = (_as_int(e.get("anilist_id")), _as_int(e.get("mal_id")), str(e.get("type") or "").upper())
+        for k in ids:
+            table.setdefault(k, val)
+    logger.info("anime-list: %d entries, %d TMDB ids (tv %d / movie %d)", entries, len(table),
+                sum(1 for k in table if k[0] == "tv"), sum(1 for k in table if k[0] == "movie"))
+    if entries and not table:
+        logger.warning("anime-list: no usable themoviedb_id in %d entries (first entry keys: %s) - "
+                       "the file format may have changed", entries,
+                       sorted(data[0].keys()) if isinstance(data[0], dict) else "?")
+    return table
+
+
+async def _anime_list_load(session):
+    """The table, or None when the source is switched off / unavailable. Loaded lazily, once per
+    process; a failed download is retried after ANIME_LIST_RETRY_SECONDS. Never raises."""
+    global _ANIME_LIST, _anime_list_lock, _anime_list_retry_at
+    if _ANIME_LIST is not None:
+        return _ANIME_LIST
+    if not USE_ANIME_LISTS or aiohttp is None or session is None:
+        return None
+    loop = asyncio.get_event_loop()
+    if loop.time() < _anime_list_retry_at:
+        return None
+    if _anime_list_lock is None:
+        _anime_list_lock = asyncio.Lock()
+    async with _anime_list_lock:
+        if _ANIME_LIST is not None:
+            return _ANIME_LIST
+        if loop.time() < _anime_list_retry_at:
+            return None
+        try:
+            async with session.get(
+                ANIME_LIST_URL, timeout=aiohttp.ClientTimeout(total=ANIME_LIST_TIMEOUT_SECONDS),
+            ) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                raw = await resp.read()
+            _ANIME_LIST = await loop.run_in_executor(None, _anime_list_build, raw)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("anime-list unavailable (%s) - not used; retry in %d min", e, ANIME_LIST_RETRY_SECONDS // 60)
+            _anime_list_retry_at = loop.time() + ANIME_LIST_RETRY_SECONDS
+            return None
+    return _ANIME_LIST
+
+
+async def _anime_list_lookup(session, media_type: str, tmdb_id):
+    """(anilist_id, mal_id, type) when this TMDB id (media_type "tv" | "movie") is in the list, else None
+    (also None while the list is unavailable)."""
+    table = await _anime_list_load(session)
+    i = _as_int(tmdb_id)
+    if not table or not i:
+        return None
+    return table.get((media_type, i))
+
+
+# ---- lookup (AniList first, Jikan when AniList failed), cache, first pass --------------------------------
+_ANIME_CACHE: "OrderedDict" = OrderedDict()      # (title without season markers, year | None) -> verdict dict
+
+
+def _anime_note(info, **kw) -> dict:
+    """info["anime"] (what handlers/autosort.py logs); a throw-away dict when info is None."""
+    a = info.setdefault("anime", {}) if info is not None else {}
+    a.update(kw)
+    return a
+
+
+def _anime_media_fields(media: dict, source: str = "anilist") -> dict:
+    """What handlers/autosort.py logs about the matched entry. A Jikan entry's id IS its MyAnimeList id
+    (there is no AniList id then), and MyAnimeList has no country of origin."""
+    t = (media or {}).get("title") or {}
+    jikan = source == "jikan"
+    return {"anilist_id": None if jikan else media.get("id"), "mal_id": media.get("id") if jikan else media.get("idMal"),
+            "format": media.get("format"), "origin": None if jikan else media.get("countryOfOrigin"),
+            "matched": t.get("romaji") or t.get("english") or t.get("native")}
+
+
+async def _anime_lookup(session, p: dict, anilist_key: str, use_anilist: bool, minutes=None) -> dict:
+    """AniList (then Jikan, only when AniList FAILED) for one parsed name, with the anime verdict cache.
+    -> {"status": "found" | "none" | "error" | "off", "source": "anilist" | "jikan" | "-",
+        "media": dict | None, "d": details, "cached": bool}
+    "none" = the source answered and did not know it; "error" = it could not answer. Errors are never
+    cached; "none" and "found" are, per title (season markers stripped) + year, so the hundreds of
+    episodes of one show cost one to three requests."""
+    off = {"status": "off", "source": "-", "media": None, "d": {}, "cached": False}
+    ap = p.get("anime") or {}
+    titles = [t for t in (ap.get("titles") or p.get("titles") or []) if t and not _generic_title(t)][:2]
+    if not titles or not use_anilist:
+        return off
+    year = p.get("year") or ap.get("year")
+    base = _strip_season_words(_norm_cmp(titles[0]))[0] or _norm_cmp(titles[0])
+    ck = (base, year or None)
+    hit = _ANIME_CACHE.get(ck)
+    if hit is not None:
+        _ANIME_CACHE.move_to_end(ck)
+        return {"status": hit["status"], "source": hit["source"], "media": hit.get("media"), "d": hit.get("d") or {},
+                "cached": True}
+
+    ctx = {"episode": bool(ap.get("has_episode") or p.get("strong_episode") or p.get("is_episode")),
+           "season": ap.get("season") or p.get("season"), "minutes": minutes}
+    queries = [_norm_cmp(t) for t in titles]
+    weak = bool(p.get("weak", False))
+
+    errored = False
+    for title in titles:
+        results = await _anilist_search(session, title, anilist_key)
+        if results is _TMDB_ERROR:
+            errored = True
+            continue
+        match, d = _anilist_best_match(results, queries, year, weak, deep=ctx)
+        if match:
+            rec = {"status": "found", "source": "anilist", "media": match, "d": d}
+            _anime_cache_put(ck, rec)
+            return dict(rec, cached=False)
+    if not errored:
+        rec = {"status": "none", "source": "anilist", "media": None, "d": {}}
+        _anime_cache_put(ck, rec)
+        return dict(rec, cached=False)
+
+    # AniList FAILED (not "not found"): Jikan answers instead - never as an extra vote
+    if not USE_JIKAN:
+        return {"status": "error", "source": "-", "media": None, "d": {}, "cached": False}
+    j_errored = False
+    for title in titles:
+        results = await _jikan_search(session, title)
+        if results is _TMDB_ERROR:
+            j_errored = True
+            continue
+        match, d = _anilist_best_match(results, queries, year, weak, deep=ctx)
+        if match:
+            rec = {"status": "found", "source": "jikan", "media": match, "d": d}
+            _anime_cache_put(ck, rec)
+            return dict(rec, cached=False)
+    # Jikan answered "not found" while AniList is unknown: report it, but do not cache it
+    return {"status": "error" if j_errored else "none", "source": "jikan", "media": None, "d": {}, "cached": False}
+
+
+def _anime_cache_put(key, rec: dict) -> None:
+    _ANIME_CACHE[key] = rec
+    _ANIME_CACHE.move_to_end(key)
+    if len(_ANIME_CACHE) > _CACHE_MAX:
+        _ANIME_CACHE.popitem(last=False)
+
+
+def _anime_year_conflict(p: dict, media: dict):
+    """AniList-FIRST guard against a live-action sibling of a long-running anime. A TV entry that is
+    still running contains every later year, so "One Piece (2023)" (the Netflix series) would match the
+    1999 anime. When the file carries a year that is NOT the show's first year (+-1), AniList does not
+    decide first; TMDB (which knows the live-action show by year) gets the file. Returns a reason or None."""
+    year = p.get("year") or (p.get("anime") or {}).get("year")
+    if not year or media.get("format") == "MOVIE":
+        return None
+    sy = (media.get("startDate") or {}).get("year") or media.get("seasonYear")
+    if sy and year > sy + 1:
+        return f"file year {year} is not the first year ({sy}) of that entry"
+    return None
+
+
+async def _anime_first_pass(session, parsed, use_anilist: bool, anilist_key: str, minutes, info: dict) -> bool:
+    """AniList FIRST for anime candidates. True = an Asian-origin AniList / Jikan match was found and
+    info["anime"] is filled; False = ask TMDB as usual (info["anime"]["anilist"] says what AniList said)."""
+    for p in parsed:
+        ap = p.get("anime")
+        if not ap or not ap.get("candidate") or p.get("extra"):
+            continue
+        res = await _anime_lookup(session, p, anilist_key, use_anilist, minutes)
+        a = _anime_note(info, anilist=res["status"])
+        if res["status"] != "found":
+            continue
+        why = _anime_year_conflict(p, res["media"])
+        if why:
+            a["anilist"] = "year-skip"
+            a.setdefault("notes", []).append("anilist-first skipped: " + why)
+            continue
+        _anime_note(info, source=res["source"], verdict="anime", **_anime_media_fields(res["media"], res["source"]))
+        if res["d"].get("dur"):
+            a.setdefault("notes", []).append(res["d"]["dur"])
+        if res["cached"]:
+            a.setdefault("notes", []).append("cached verdict")
+        return True
+    return False
+
+
+# ---- TMDB side of the anime verdict -----------------------------------------------------------------------
+def _tmdb_asian_origin(result: dict):
+    """"original_language=ja" / "origin_country=JP" when a TMDB result has an Asian origin, else None."""
+    lang = result.get("original_language")
+    if lang in _ANIME_ORIGIN_LANGUAGES:
+        return f"original_language={lang}"
+    for c in result.get("origin_country") or []:
+        if c in ANILIST_ORIGINS:
+            return f"origin_country={c}"
+    return None
+
+
+async def _tmdb_anime_confirm(session, match: dict, media_type: str, mid, animated: bool):
+    """deep_anime rule for a TMDB match that is not (Animation + ja / zh / ko): anime when it is Animation
+    with an Asian origin_country, or its id is in the anime list. TMDB keywords never decide.
+    A live-action match (genres known, no Animation) is never anime. The list also counts when TMDB has
+    no genres for the title yet.
+    -> (is_anime, source, why, list_state) with list_state "hit" | "miss" | "unavailable" | None (not asked)"""
+    if animated:
+        origin = _tmdb_asian_origin(match)
+        if origin:
+            return True, "tmdb", f"animation + {origin}", None
+    if mid and (animated or not (match.get("genre_ids") or [])):
+        hit = await _anime_list_lookup(session, media_type, mid)
+        if hit:
+            return True, "animelist", (f"tmdb {media_type} {mid} is in the anime list "
+                                       f"(anilist {hit[0] or '-'}, mal {hit[1] or '-'})"), "hit"
+        return False, None, "", ("unavailable" if _ANIME_LIST is None else "miss")
+    return False, None, "", None
+
+
+def _anime_tmdb_fields(info, animated: bool, lang, origin, source=None, why=None, animelist=None) -> None:
+    """What TMDB said, for the log line (and for _anime_downgrade_note)."""
+    a = _anime_note(info, tmdb_animated=bool(animated), tmdb_lang=lang, tmdb_origin=origin or None)
+    if source:
+        a["source"], a["verdict"] = source, "anime"
+    if why:
+        a.setdefault("notes", []).append(why)
+    if animelist:
+        a["animelist"] = animelist
+
+
+async def _anime_downgrade_note(session, tmdb_key: str, info: dict) -> None:
+    """The OLD rule (TMDB keywords such as japan / samurai / edo period) would have called this animated
+    TMDB title anime; the new rules did not. Say so in info["anime"]["downgraded"] (the log line explains
+    why a title like Blue Eye Samurai is now a series). Log-only: the verdict is already made."""
+    a = (info or {}).get("anime") or {}
+    media, mid = info.get("tmdb_media"), info.get("tmdb_id")
+    if not a.get("tmdb_animated") or not media or not mid or a.get("verdict") == "anime":
+        return
+    kws = await _tmdb_keywords(session, media, mid, tmdb_key)
+    if kws is _TMDB_ERROR:
+        return
+    words = _ANIME_MOVIE_KEYWORDS if media == "movie" else _ANIME_KEYWORDS
+    said = sorted({(k.get("name") or "").strip().lower() for k in kws or []
+                   if (k.get("name") or "").strip().lower() in words or k.get("id") in _ANIME_KEYWORD_IDS})
+    if said:
+        a["downgraded"] = (f"tmdb {media} {mid} is animated (lang={a.get('tmdb_lang')}, origin={a.get('tmdb_origin') or '-'}) "
+                           f"and its keywords say anime ({', '.join(said)}), but it has no Asian origin, is not in the "
+                           f"anime list ({a.get('animelist') or 'not checked'}) and AniList says {a.get('anilist') or '-'}")
