@@ -826,6 +826,9 @@ async def next_filters_buttons(user_id):
        InlineKeyboardButton('📺 sᴇʀɪᴇs ᴡʜɪᴛᴇʟɪsᴛ',
                     callback_data='settings#get_series')
        ],[
+       InlineKeyboardButton('🗂 ᴀᴜᴛᴏsᴏʀᴛ',
+                    callback_data='settings#asmenu')
+       ],[
        InlineKeyboardButton('ʙᴀᴄᴋ', 
                     callback_data="settings#main")
        ]]
