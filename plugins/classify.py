@@ -96,6 +96,17 @@ Steps for a video file:
      candidates. A bracket counts as an anime fansub tag only when it is a plausible group
      name at the start of the name. See the "deep SERIES identification" section at the end.
 
+ 12. /autosort only (deep_series=True), MOVIE names: the release name is cleaned much harder
+     (_movie_info(): @handles, site names, release groups, quality / codec / language words, the
+     year in brackets; a language word is kept as a signal), a title that is only digits ("2012")
+     is allowed when the year agrees, spaced initials are joined ("M S M" -> "MSM"), titles are
+     scored with rapidfuzz (difflib when it is not installed), and a film TMDB does not know is
+     tried with transliteration variants ("Chaadum" / "Chadum", year + Indian language needed) and
+     then on Wikidata (label + year + film class). Archives (zip, rar, 7z ...) become "files"
+     instead of "other". classify_async(info=...) also says WHY a file is "other":
+     info["other_reason"] / info["other_detail"] (read by handlers/autosort.py).
+     See "deep MOVIE identification" in the middle of this file.
+
 Non-video routing (pdf / image / audio / files / other) is extension
 based, exactly as before.
 
@@ -185,6 +196,10 @@ PDF_EXTENSIONS = {".pdf"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".tiff"}
 AUDIO_EXTENSIONS = {".mp3", ".flac", ".m4a", ".wav", ".ogg", ".opus", ".aac"}
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".webm", ".mov", ".wmv", ".ts", ".m4v", ".flv"}
+# Archives. Only /autosort (classify_async(deep_series=True)) files them under "files"
+# ("Files (Unidentified)"); everywhere else they stay "other" exactly as before. Split-archive
+# forms (.7z.001, .part1.rar, .r00) are already caught by _SPLIT_PART_PATTERNS below.
+ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".iso"}
 
 # Split/multi-part archive fragments - "Title.part001.mkv", "archive.7z.002",
 # old-style "archive.r00" RAR volumes.
@@ -1025,6 +1040,230 @@ def _build_candidates(shape: dict, extra_titles=()) -> list:
     return out
 
 
+# ------------------------------------------------------------
+# Deep MOVIE name preparation - opt-in via _parse_name(..., deep=True), i.e. /autosort only
+# ------------------------------------------------------------
+# A film release name carries a lot that is not the title: "@handle - " / "[handle]" prefixes, quality /
+# source / audio / platform words, language words and codes, release groups ("-ATH", "(HmaDi007) -
+# (HmaDi007)"). _movie_info() cuts the TITLE out of one name (pure string work, no network) and records what
+# it saw. The title ends at the first technical token (quality, source, codec, audio, ...), at the release
+# year, or at a run of language / platform words - never at the very first word, so a film called "Cam" or
+# "2012" survives. Everything after the cut is only inspected for language signals and release groups.
+#   Mal, Hin, Malayalam, FR EN, ita eng, sub ita eng, DUAL-AUDIO, JPN-ENG ...  -> "languages" (never in the title)
+#   TS, HDTS, CAM, NF, MMAX, DS4K, WEBRip, x265, DDP5.1, DTS-HD.MA, 6CH ...    -> removed
+# Env: MOVIE_RELEASE_TAGS = extra release-group / uploader tags, comma separated.
+_MOVIE_TAGS_NORM = {re.sub(r"[^a-z0-9]", "", t.lower()) for t in (
+    "ATH", "Saon", "FraMeSToR", "HmaDi007", "Licdom", "PrimeFix", "PSA", "YourShivay", "RARBG", "YTS", "YIFY",
+    "GalaxyRG", "TGx", "MeGusta", "NTb", "CMRG", "EVO", "Pahe", "Tigole", "QxR",
+    *_UPLOADER_TAGS, *os.environ.get("MOVIE_RELEASE_TAGS", "").split(","))} - {""}
+
+# One token that is certainly technical (a title never contains it): resolution, source, codec, audio, channels.
+_MOVIE_STRONG_RE = re.compile(
+    r"^(?:\d{3,4}[pi]|[248]k|uhd|hdr\d*|"
+    r"web(?:[-.]?dl|[-.]?rip)?|blu[-.]?ray|bd[-.]?rip|br[-.]?rip|dvd[-.]?rip|dvd[-.]?scr|hd[-.]?rip|hd[-.]?tv|"
+    r"hd[-.]?ts|hd[-.]?cam|pre[-.]?dvd|remux|ds4k|"
+    r"x26[45]|h[-.]?26[45]|hevc|avc|av1|xvid|divx|10[-.]?bit|8[-.]?bit|"
+    r"aac\d*(?:\.\d)?|e?[-.]?ac[-.]?3|dd[p+]\d*(?:\.\d)?|dd\d(?:\.\d)?|dts(?:[-.]?hd)?(?:[-.]?ma)?|truehd|atmos|"
+    r"flac|mp3|opus|\d{1,2}ch|\d\.\d)"
+    r"(?:[-.+][A-Za-z0-9.+-]*)?$", re.IGNORECASE)
+# Words that are technical / language tags but could also be a title word ("Cam", "Mal"): they only end the
+# title when a tag, a technical word or the year follows (or they close the name).
+_MOVIE_WEAK = {
+    "ts", "cam", "scr", "nf", "amzn", "dsnp", "jiohs", "jhs", "mmax", "hs", "zee5", "sonyliv", "sliv", "hotstar",
+    "jiohotstar", "netflix", "dual", "audio", "multi", "sub", "subs", "esub", "esubs", "msub", "msubs", "hsub",
+    "hsubs", "dubbed", "dub", "org", "ma", "hd", "fr", "en", "eng", "ita", "jpn", "jap", "spa", "ger", "rus", "kor",
+    "chi", "fre", "hin", "mal", "tam", "tel", "kan", "english", "french", "italian", "japanese", "spanish",
+    "german", "russian", "korean", "chinese", *_LANG_FULL,
+}
+_MOVIE_LANG_WORDS = _MOVIE_WEAK - {"ts", "cam", "scr", "nf", "amzn", "dsnp", "jiohs", "jhs", "mmax", "hs", "zee5",
+                                   "sonyliv", "sliv", "hotstar", "jiohotstar", "netflix", "sub", "subs", "esub",
+                                   "esubs", "msub", "msubs", "hsub", "hsubs", "dubbed", "dub", "org", "ma", "hd",
+                                   "dual", "audio", "multi"}
+_MOVIE_BRACKET_YEAR_RE = re.compile(r"[\(\[]\s*((?:19|20)\d{2})\s*[\)\]]")
+_MOVIE_BRACKET_HANDLE_RE = re.compile(r"^\s*\[\s*([A-Za-z0-9]+(?:_[A-Za-z0-9]+)+)\s*\]\s*[-–—:|]*\s*")
+_TRANSLIT_HINT_RE = re.compile(r"aa|ii|uu|dh|bh|kh|gh|zh|chh", re.IGNORECASE)
+
+
+def _movie_tok(tok: str) -> str:
+    """'year' | 'strong' | 'weak' | '' for one token of a release name (edge punctuation ignored)."""
+    t = tok.strip("-–—:,;|~.'\"!?*")
+    if not t:
+        return ""
+    if re.fullmatch(r"(?:19|20)\d{2}", t):
+        return "year" if int(t) <= datetime.date.today().year + 1 else ""
+    if _MOVIE_STRONG_RE.match(t):
+        return "strong"
+    parts = [x for x in re.split(r"[-+/&]+", t.lower()) if x]
+    return "weak" if parts and all(x in _MOVIE_WEAK for x in parts) else ""
+
+
+def _case_like(src: str, repl: str) -> str:
+    if len(src) > 1 and src.isupper():
+        return repl.upper()
+    return repl[:1].upper() + repl[1:] if src[:1].isupper() else repl
+
+
+_TR_VOWELS_PLAIN = ((r"aa+", "a"), (r"ee+", "e"), (r"oo+", "o"), (r"ii+", "i"), (r"uu+", "u"))
+_TR_VOWELS_INDIC = ((r"aa+", "a"), (r"ee+", "i"), (r"oo+", "u"), (r"ii+", "i"), (r"uu+", "u"))
+_TR_CONSONANTS = ((r"([bcdfgjklmnpqrstvwxyz])\1+", None),)           # doubled consonant -> one
+_TR_ASPIRATES = ((r"th", "t"), (r"dh", "d"))                          # th / dh -> t / d
+_TR_COMBOS = (
+    (_TR_VOWELS_PLAIN,), (_TR_VOWELS_INDIC,),
+    (_TR_VOWELS_PLAIN, _TR_CONSONANTS), (_TR_VOWELS_INDIC, _TR_CONSONANTS), (_TR_CONSONANTS,),
+    (_TR_VOWELS_PLAIN, _TR_CONSONANTS, _TR_ASPIRATES), (_TR_VOWELS_INDIC, _TR_CONSONANTS, _TR_ASPIRATES),
+    (_TR_ASPIRATES,),
+)
+
+
+def _translit_variants(title: str, limit=None) -> list:
+    """Spelling variants of an Indian-language title, most likely first, never the title itself:
+    "Chaadum" -> "Chadum" (aa -> a, ee -> e / i, oo -> o / u), doubled consonants collapsed, th / dh -> t / d."""
+    seen, out = {_norm_cmp(title)}, []
+    for combo in _TR_COMBOS:
+        text = title
+        for rules in combo:
+            for pat, repl in rules:
+                text = re.sub(pat, (lambda m, r=repl: _case_like(m.group(0), r if r is not None else m.group(1))),
+                              text, flags=re.IGNORECASE)
+        key = _norm_cmp(text)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(text)
+    return out if limit is None else out[:limit]
+
+
+def _translit_keys(text: str) -> set:
+    """Spacing-free forms of a title and all its variants: two spellings of one title share a key."""
+    return {_norm_cmp(v).replace(" ", "") for v in [text, *_translit_variants(text)] if v}
+
+
+def _movie_info(raw: str) -> dict:
+    """Pure clean-up of one release name for deep MOVIE identification (no network, never raises).
+      title        the cut-out title ("M S M", "2012", "Kalaratri")        year   release year or None
+      year_in_brackets  the year came from "(2009)" / "[2009]"
+      titles       search titles: the title, then spaced initials joined ("M S M" -> "MSM", "M.S.M")
+      digits       the title is only digits ("2012"): the year is REQUIRED to agree with the TMDB result
+      languages    language words / codes read after the title        indian  one of them is an Indian language
+      tags         release groups / uploader tags seen after the title  handle  "@handle" / "[handle]" prefix
+      tech         a technical token (quality / source / codec ...) was seen
+      variants     transliteration variants of the title (only with a year and an Indian-language hint)
+      usable       there is something to search for (a digits-only title needs its year)"""
+    out = {"title": "", "titles": [], "year": None, "year_in_brackets": False, "digits": False, "initials": False,
+           "languages": [], "indian": False, "tags": [], "handle": None, "tech": False, "variants": [],
+           "usable": False}
+    try:
+        stem = _VIDEO_EXT_END_RE.sub("", raw or "").strip()
+        if not stem:
+            return out
+        hm = _HANDLE_RE.search(stem)
+        out["handle"] = hm.group(0) if hm else None
+        text = _clean_name(stem)                              # @handles, URLs, www.site tags, emoji, empty brackets
+        m = _MOVIE_BRACKET_HANDLE_RE.match(text)              # "[VC_Movie] Title ..."
+        if m:
+            out["handle"] = out["handle"] or m.group(1)
+            text = text[m.end():]
+        max_year = datetime.date.today().year + 1
+        bracket_year = []
+
+        def _by(mm):
+            if int(mm.group(1)) <= max_year:
+                bracket_year.append(int(mm.group(1)))
+            return f" {mm.group(1)} "
+
+        text = _MOVIE_BRACKET_YEAR_RE.sub(_by, text)
+        text = re.sub(r"[\[\]\(\)【】「」{}]", " ", text)
+        # _spaced() keeps the dot between two digits ("5.1"); "2016.1080p" / "x265.10bit" are two tokens
+        text = re.sub(r"(?<=\d{3})\.(?=\d)|(?<=\d)\.(?=\d{3})", " ", text)
+        text = re.sub(r"(?<![A-Za-z0-9])h[\s.]26([45])(?![0-9])", r"x26\1", text, flags=re.IGNORECASE)
+        toks = re.sub(r"\s{2,}", " ", _spaced(text)).split()
+        n = len(toks)
+        if not n:
+            return out
+        kinds = [_movie_tok(t) for t in toks]
+        strong_idx = next((i for i in range(1, n) if kinds[i] == "strong"), n)
+        year_idx = max((i for i in range(1, strong_idx) if kinds[i] == "year"), default=None)
+        weak_idx = next((i for i in range(1, n) if kinds[i] == "weak"
+                         and (i == n - 1 or kinds[i + 1] in ("weak", "strong", "year"))), None)
+        cut = min(strong_idx, n if year_idx is None else year_idx, n if weak_idx is None else weak_idx)
+        if year_idx is None:
+            year_idx = next((i for i in range(1, n) if kinds[i] == "year"), None)
+        if year_idx is not None:
+            out["year"] = int(toks[year_idx].strip("-–—:,;|~.'\"!?*"))
+            out["year_in_brackets"] = out["year"] in bracket_year
+        out["tech"] = strong_idx < n
+
+        title_toks = toks[:cut]
+        while len(title_toks) > 1 and (not re.search(r"[^\W_]", title_toks[-1])
+                                       or re.sub(r"[^a-z0-9]", "", title_toks[-1].lower()) in _MOVIE_TAGS_NORM):
+            title_toks.pop()                                  # a trailing "-" or release-group tag
+        title = re.sub(r"^[\s\-–—_:|~.,]+|[\s\-–—_:|~.,]+$", "", " ".join(title_toks))
+        out["title"] = title
+
+        langs, tags = [], []
+        for tok in toks[cut:]:
+            low = tok.strip("-–—:,;|~.'\"!?*").lower()
+            parts = [x for x in re.split(r"[-+/&]+", low) if x]
+            for part in parts:
+                if part in _MOVIE_LANG_WORDS and part not in langs:
+                    langs.append(part)
+                    if part in _LANG_ANY:
+                        out["indian"] = True
+                if re.sub(r"[^a-z0-9]", "", part) in _MOVIE_TAGS_NORM and part not in tags:
+                    tags.append(part)
+            if {"dual", "multi"} & set(parts) and "audio" in parts and "dual-audio" not in langs:
+                langs.append("dual-audio")
+        out["languages"], out["tags"] = langs, tags
+
+        words = title.split()
+        out["digits"] = bool(re.fullmatch(r"\d+", title))
+        out["initials"] = len(words) >= 2 and all(re.fullmatch(r"[^\W\d_]\.?", w) for w in words)
+        titles = [title] if title else []
+        if out["initials"]:
+            letters = [w.rstrip(".") for w in words]
+            titles += ["".join(letters), ".".join(letters)]  # "MSM", "M.S.M"
+        out["titles"] = list(dict.fromkeys(t for t in titles if t))
+        out["usable"] = bool(len(re.findall(r"[^\W_]", title)) >= 2 and (not out["digits"] or out["year"]))
+        if out["usable"] and out["year"] and not out["digits"] and (out["indian"] or _TRANSLIT_HINT_RE.search(title)):
+            out["variants"] = _translit_variants(title)
+    except Exception as e:                                    # never raise from an identification layer
+        logger.debug("movie name clean-up failed on %r: %s", raw, e)
+        out["usable"] = False
+    return out
+
+
+def _movie_attach(p: dict, mv: dict) -> None:
+    """Deep-movie part of _parse_name(): for a MOVIE-LIKE name (no episode / season marker, not a date
+    episode, not a sample / trailer, not a strong anime candidate) sets p["movie"] = mv and makes the cut-out title
+    (plus joined initials) the first search titles, takes the year the clean-up found when the name has it in
+    brackets (guessit reads "2012 (2009)" as 2012), treats a name with a year or a technical token as having a
+    release signal, and - for a number-only title - requires the year to agree. Anything else: p["movie"] stays None."""
+    p["movie"] = None
+    a = p.get("anime") or {}
+    if not (mv and mv.get("usable") and not p["strong_episode"] and not p["series_like"] and not p["date_episode"]
+            and not p["extra"] and not a.get("strong")):
+        return
+    if p["is_episode"] and not p["anime_tag"] and mv["year_in_brackets"]:
+        # only guessit's guess said "episode" (it read "2012" as season 20, episode 12): "Title (year)" is a film
+        p["is_episode"], p["gtype"], p["anime_hint"] = False, "movie", False
+    titles = list(mv["titles"])
+    seen = {_norm_cmp(t) for t in titles}
+    for t in p["titles"]:
+        k = _norm_cmp(t)
+        if k and k not in seen and not _generic_title(t):
+            seen.add(k)
+            titles.append(t)
+    p["titles"] = titles[:4]
+    p["candidates"] = [{"title": t, "dropped": 0, "kind": "movie"} for t in p["titles"]]
+    p["clean_title"] = mv["title"]
+    if mv["year"] and (p["year"] is None or mv["year_in_brackets"]):
+        p["year"] = mv["year"]
+    if mv["year"] or mv["tech"]:
+        p["weak"] = False                                     # a year / a quality tag IS a release signal
+        p["has_movie_signal"] = True
+    p["year_required"] = bool(mv["digits"])
+    p["movie"] = mv
+
+
 def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: bool = False):
     """Parse one candidate name. Returns a dict or None if no usable title.
 
@@ -1046,6 +1285,9 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: 
     signal, groups, season / part / episode, anime-candidate signals), flags NCOP / NCED / AMV ... as
     extras and, for a strong anime candidate, replaces the title candidates by the cleaned anime ones.
     Otherwise p["anime"] is None and nothing changes.
+
+    deep=True also fills p["movie"] for a MOVIE-LIKE name (see _movie_info() / _movie_attach()): the cut-out
+    title, joined initials, a bracketed year, a number-only title with a required year. Otherwise it is None.
     """
     if not raw:
         return None
@@ -1053,6 +1295,7 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: 
         raw = _url_decode(raw)
     anime = bool(anime and deep)
     name = _strip_split_suffix(raw) if _is_split_part(raw) else raw
+    mv = _movie_info(name) if deep else None      # deep MOVIE clean-up (pure string work), attached at the end
     if anime:
         m_ext = _VIDEO_EXT_END_RE.search(name)
         body, ext = (name[:m_ext.start()], m_ext.group(0)) if m_ext else (name, "")
@@ -1126,6 +1369,8 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: 
         # deep: "Episode" / "Part" / "Video" / a bare language, a single letter or number and
         # bare platform names are not titles
         titles = [t for t in titles if not _generic_title(t) and t.lower() not in prep["platforms"]]
+    if not titles and mv and mv["usable"] and mv["digits"]:
+        titles = [mv["title"]]                    # "2012 (2009)": a number-only title is allowed (its year must agree)
     titles = titles[:max_titles]
     if not titles:
         return None
@@ -1195,9 +1440,12 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: 
         "uploaders": list(norm["uploaders"]) if norm else [],
         "candidates": cands or [],
         "anime": None,
+        "movie": None,
     }
     if anime:
         _anime_attach(result, pre_norm, check_extra)
+    if mv is not None:
+        _movie_attach(result, mv)
     return result
 
 
@@ -1223,9 +1471,12 @@ def _detect_type(name: str) -> "str | None":
 # ============================================================
 # Non-TMDB routing
 # ============================================================
-def _early_category(message):
+def _early_category(message, archives_as_files: bool = False):
     """(category, names, is_files_variant). category is None for videos
-    that still need title-based identification."""
+    that still need title-based identification.
+
+    archives_as_files (only /autosort's deep mode passes True): a zip / rar / 7z / ... file is
+    "files" instead of "other". Default False, so /fwd, the whitelists and /autosortai are unchanged."""
     if getattr(message, "photo", None):
         return "image", [], False
 
@@ -1252,6 +1503,8 @@ def _early_category(message):
     is_split = _is_split_part(filename)
     is_video_ext = ext in VIDEO_EXTENSIONS
     if not is_video_ext and not is_split:
+        if archives_as_files and ext in ARCHIVE_EXTENSIONS:
+            return "files", [], False
         return "other", [], False
     if is_split and not is_video_ext:
         return "files", [], False
@@ -1260,6 +1513,26 @@ def _early_category(message):
     # genuine document upload (see /diagnose_media).
     is_files_variant = getattr(message, "document", None) is not None
     return None, _candidate_names(message), is_files_variant
+
+
+def _other_note(info, reason: str, detail: str = "") -> None:
+    """Tell /autosort WHY a file is "other" (info["other_reason"] / info["other_detail"]; the first
+    reason reported wins). Log information only: it never changes the returned category."""
+    if info is not None and "other_reason" not in info:
+        info["other_reason"], info["other_detail"] = reason, detail
+
+
+def _early_other_reason(message, early: str):
+    """(reason, detail) for a message _early_category() answered "other" / "files" without looking
+    at its title (see handlers/autosort.py for the reason names)."""
+    if early == "files":
+        return "archive", "archive or split part"
+    filename = get_filename(message)
+    if filename:
+        return "other_type", f"extension {os.path.splitext(filename)[1].lower() or '-'} is not video / pdf / image / audio / archive"
+    if getattr(message, "video", None) is not None:
+        return "unidentified", "video without a file name or a usable caption"
+    return "other_type", "no file name (not a video, photo, audio or document)"
 
 
 def classify(message) -> str:
@@ -1403,6 +1676,23 @@ def _title_score(query: str, cand: str) -> float:
     if _DIGITS.findall(query) != _DIGITS.findall(cand):
         return 0.0
     return SequenceMatcher(None, query, cand).ratio()
+
+
+def _title_score_movie(query: str, cand: str) -> float:
+    """_title_score() for deep MOVIE names (/autosort only): the same exact / digit rules, spacing ignored
+    ("m s m" == "msm"), and rapidfuzz for the fuzzy part when it is installed - else the old _title_score()."""
+    if not query or not cand:
+        return 0.0
+    if query == cand:
+        return 1.0
+    if _DIGITS.findall(query) != _DIGITS.findall(cand):
+        return 0.0
+    sq, sc = query.replace(" ", ""), cand.replace(" ", "")
+    if len(sq) >= 3 and sq == sc:
+        return 1.0
+    if _rf_fuzz is not None:
+        return _rf_fuzz.ratio(query, cand) / 100.0
+    return _title_score(query, cand)
 
 
 def _year_of(date):
@@ -1819,22 +2109,28 @@ def _keywords_say_anime(keywords, strict: bool = False) -> bool:
     return False
 
 
-def _best_match(results, media_type: str, queries, year, strict: bool, prefer_anime: bool = False, min_votes: int = STRICT_MIN_VOTES):
+def _best_match(results, media_type: str, queries, year, strict: bool, prefer_anime: bool = False, min_votes: int = STRICT_MIN_VOTES,
+                scorer=None, year_required: bool = False):
     """Pick the TMDB result whose title genuinely matches, or None.
 
     prefer_anime: when two TV results match the title equally well (the
     anime "One Piece" vs the live-action "One Piece", Cowboy Bebop, Death
     Note, ...), pick the anime one if the filename looks like anime.
     Before this, the entry with more TMDB votes won, which was often the
-    live-action remake -> the anime got filed as a normal series."""
+    live-action remake -> the anime got filed as a normal series.
+
+    scorer / year_required: only /autosort's deep movie names pass them (scorer = _title_score_movie;
+    year_required = a number-only title: a MOVIE result must carry a release year that agrees). The
+    defaults keep every other caller exactly as before."""
     best, best_key = None, None
+    score_fn = scorer or _title_score
     for r in (results or [])[:10]:
         if media_type == "movie":
             names = (r.get("title"), r.get("original_title"))
         else:
             names = (r.get("name"), r.get("original_name"))
         score = max(
-            (_title_score(q, _norm_cmp(n)) for q in queries for n in names if n),
+            (score_fn(q, _norm_cmp(n)) for q in queries for n in names if n),
             default=0.0,
         )
         if score < (1.0 if strict else MIN_TITLE_SCORE):
@@ -1849,6 +2145,8 @@ def _best_match(results, media_type: str, queries, year, strict: bool, prefer_an
             if media_type == "movie" and abs(ry - year) > 1:
                 continue
             year_bonus = 1 if ry == year else 0
+        elif year_required and media_type == "movie":
+            continue                      # no release year to compare: not good enough for a number-only title
         anime_pref = 1 if (prefer_anime and media_type == "tv" and _is_anime_result(r, "tv")) else 0
         key = (score, anime_pref, year_bonus, votes)
         if best is None or key > best_key:
@@ -1885,6 +2183,10 @@ async def _tmdb_identify_core(session, tmdb_key: str, p: dict, anime_mode: bool 
     # Episode / season naming (this name, or any other name of the same file:
     # see "series_like" in classify_async) is only ever looked up as TV.
     order = ["tv"] if (p["is_episode"] or p.get("series_like")) else ["movie", "tv"]
+    if p.get("year_required"):
+        order = ["movie"]                 # deep movie name that is only a number ("2012"): films only, year must agree
+    scorer = _title_score_movie if p.get("movie") else None       # deep movie names only
+    year_required = bool(p.get("year_required"))
     queries = [_norm_cmp(t) for t in p["titles"]]
     errored = False
     for media_type in order:
@@ -1895,14 +2197,14 @@ async def _tmdb_identify_core(session, tmdb_key: str, p: dict, anime_mode: bool 
                 continue
             hint = p.get("anime_hint", False)
             min_votes = EPISODE_MIN_VOTES if (media_type == "tv" and p.get("strong_episode")) else STRICT_MIN_VOTES
-            match = _best_match(results, media_type, queries, p["year"], p["weak"], hint, min_votes)
+            match = _best_match(results, media_type, queries, p["year"], p["weak"], hint, min_votes, scorer, year_required)
             if not match and media_type == "movie" and p["year"]:
                 # Extra page of candidates filtered by year on TMDB's side.
                 results = await _tmdb_search(session, media_type, title, tmdb_key, p["year"])
                 if results is _TMDB_ERROR:
                     errored = True
                     continue
-                match = _best_match(results, media_type, queries, p["year"], p["weak"], hint, min_votes)
+                match = _best_match(results, media_type, queries, p["year"], p["weak"], hint, min_votes, scorer, year_required)
             if not match and results:
                 match = await _match_by_alt_titles(
                     session, results, media_type, queries, p["year"], p["weak"], tmdb_key)
@@ -2298,8 +2600,10 @@ async def classify_async(message, session=None, tmdb_key: str = "", use_anilist:
     Fribb anime list, or AniList do), and NCOP / NCED / AMV / ... are extras. It may fill info["anime"].
     See "/autosort deep ANIME identification" at the end of this file.
     """
-    early, names, is_files = _early_category(message)
+    early, names, is_files = _early_category(message, archives_as_files=deep_series)
     if early is not None:
+        if early in ("other", "files"):
+            _other_note(info, *_early_other_reason(message, early))
         return early
 
     tmdb_key = tmdb_key or ENV_TMDB_API_KEY
@@ -2331,8 +2635,10 @@ async def classify_async(message, session=None, tmdb_key: str = "", use_anilist:
         if p:
             parsed.append(p)
     if not parsed:
+        _other_note(info, "unidentified", "no usable title in the name")
         return await _other_or_openai(message, names, is_files, session, openai_key)
     if parsed[0]["extra"]:
+        _other_note(info, "extra", "sample / trailer / promo / recap in the name")
         if deep_series and info is not None and any(pp["strong_episode"] for pp in parsed):
             info["series"] = {"candidate": True, "source": "-", "reason": "extra (sample/promo/trailer/recap) -> other",
                               "title": parsed[0].get("clean_title") or parsed[0]["titles"][0],
@@ -2394,6 +2700,11 @@ async def matches_async(message, wanted: str, session=None, tmdb_key: str = "", 
 #   MOVIE_RATIO_UNKNOWN   "other" (default) | "allow": no thumbnail size at all
 #   MOVIE_MIN_MINUTES     shorter videos are not movies, default 45
 #   MOVIE_RUNTIME_TOLERANCE  allowed |file - TMDB runtime| / TMDB runtime, default 0.35
+#   SPLIT_PARTS_SKIP_DURATION  1 (default) | 0: a split video part (".part004.mkv", ".mkv.001") is only
+#                         a slice of the film, so the duration guard and the TMDB runtime check
+#                         (all three gates) skip it. Its thumbnail rules still apply.
+# Documents (message.document, not message.video) skip the thumbnail / ratio / duration / runtime
+# gates altogether: Telegram gives a document no preview size and no duration - handlers/autosort.py.
 _DEFAULT_THUMB_RATIO_MIN = 1.30
 _DEFAULT_THUMB_RATIO_MAX = 2.40
 _DEFAULT_MIN_MINUTES = 45.0
@@ -2525,6 +2836,21 @@ async def tmdb_movie_runtime(session, tmdb_id, tmdb_key: str = "") -> int:
         if owns:
             await session.close()
     return 0 if runtime is _TMDB_ERROR else runtime
+
+
+SPLIT_PARTS_SKIP_DURATION = os.environ.get("SPLIT_PARTS_SKIP_DURATION", "1").strip().lower() not in ("0", "false", "no")
+
+
+def is_split_video_part(message) -> bool:
+    """True for one slice of a split video: ".part004.mkv", "name.mkv.001", "name.mkv.r00". The file must be
+    a split name AND the whole file must carry a video extension, so a ".part1.rar" archive is not one."""
+    name = ""
+    try:
+        name = get_filename(message) or ""
+        return (_is_split_part(name)
+                and os.path.splitext(_strip_split_suffix(name))[1].lower() in VIDEO_EXTENSIONS)
+    except Exception:
+        return False
 
 
 def runtime_mismatch(file_minutes, runtime_minutes) -> bool:
@@ -3365,6 +3691,214 @@ async def _wikidata_facts_for(session, p: dict):
     return (entry["facts"], "found") if entry["verdict"] == "found" else (None, "none")
 
 
+# ---- deep MOVIE identification: what happens when TMDB answered "not found" -----------------------------------------
+# Only for MOVIE-LIKE names (p["movie"], see _movie_info()) in /autosort's deep mode, and only after the normal
+# TMDB search of the cleaned titles found nothing (TMDB reachable, no match). In this order:
+#   1. TRANSLITERATION VARIANTS ("Chaadum" -> "Chadum"): TMDB is searched with each variant, and a result counts
+#      ONLY when the file has a year AND the result's release year agrees (+-1) AND the title equals the file's
+#      title in some spelling variant AND the file says Indian language (Mal / Hin / Malayalam ...) or TMDB lists the
+#      film in an Indian original language. So a variant can never match a wrong film.
+#   2. WIKIDATA, strict: the item's label / alias equals the title, its publication year (P577) agrees (+-1) and one
+#      of its "instance of" classes is a FILM class. No Q-id is trusted blindly: a class is a film class when its
+#      English label is "film" (Q11424) / "<genre> film" / "feature film", or one of its "subclass of" parents is.
+# Env vars (all optional):  MOVIE_VARIANT_SEARCHES=4  variants searched per film (0 = off)
+#                           USE_WIKIDATA_FILMS=1      Wikidata for films (also needs USE_WIKIDATA=1)
+MOVIE_VARIANT_SEARCHES = max(0, min(8, int(_env_float("MOVIE_VARIANT_SEARCHES", 4))))
+USE_WIKIDATA_FILMS = os.environ.get("USE_WIKIDATA_FILMS", "1").strip().lower() not in ("0", "false", "no")
+_INDIAN_LANGS = {"hi", "ml", "ta", "te", "kn", "mr", "bn", "pa", "gu", "bho", "or", "as", "ur"}
+_WD_FILM_NOT_WORDS = ("series", "festival", "studio", "character", "score", "award", "genre", "franchise",
+                      "adaptation", "critic", "industry", "company", "list of", "category", "short film",
+                      "soundtrack", "poster")
+_WD_FILM_CACHE: "OrderedDict" = OrderedDict()      # class Q-id -> bool (is it a film class)
+
+
+def _movie_note(info, **kw) -> dict:
+    """info["movie"] (what handlers/autosort.py may log); a throw-away dict when info is None."""
+    m = info.setdefault("movie", {}) if info is not None else {}
+    m.update(kw)
+    return m
+
+
+async def _tmdb_movie_variants(session, tmdb_key: str, p: dict):
+    """-> (result | None, errored): the TMDB movie that carries one of the transliteration variants of the file's
+    title, with the year (+-1) and Indian-language conditions described above."""
+    mv, year = p["movie"], p.get("year")
+    if not year or not mv["variants"] or MOVIE_VARIANT_SEARCHES <= 0:
+        return None, False
+    mine = _translit_keys(mv["title"])
+    best, best_key, errored = None, None, False
+    for variant in mv["variants"][:MOVIE_VARIANT_SEARCHES]:
+        results = await _tmdb_search(session, "movie", variant, tmdb_key)
+        if results is _TMDB_ERROR:
+            errored = True
+            continue
+        for r in (results or [])[:10]:
+            ry = _year_of(r.get("release_date"))
+            if not ry or abs(ry - year) > 1:
+                continue
+            if not (mv["indian"] or r.get("original_language") in _INDIAN_LANGS):
+                continue
+            names = [n for n in (r.get("title"), r.get("original_title")) if n]
+            if not any(mine & _translit_keys(n) for n in names):
+                continue
+            key = (1 if ry == year else 0, r.get("vote_count") or 0)
+            if best is None or key > best_key:
+                best, best_key = r, key
+        if best is not None:
+            break
+    return best, errored
+
+
+def _wd_label_says_film(label: str) -> bool:
+    low = (label or "").strip().lower()
+    if not low or any(w in low for w in _WD_FILM_NOT_WORDS):
+        return False
+    return low == "film" or low.endswith(" film")          # "film", "feature film", "comedy film", "animated film" ...
+
+
+async def _wd_class_is_film(session, qid: str, depth: int = 0):
+    """True / False, or None when Wikidata could not be asked (nothing is cached then). Q11424 ("film") is found
+    by its English label like every other class; "subclass of" parents are followed up to two steps."""
+    hit = _WD_FILM_CACHE.get(qid)
+    if hit is not None:
+        _WD_FILM_CACHE.move_to_end(qid)
+        return hit
+    data = await _wikidata_get(session, {"action": "wbgetentities", "ids": qid, "props": "labels|claims",
+                                         "languages": "en"})
+    if data is _TMDB_ERROR:
+        return None
+    ent = (data.get("entities") or {}).get(qid) or {}
+    label = ((ent.get("labels") or {}).get("en") or {}).get("value") or ""
+    result = _wd_label_says_film(label)
+    if not result and depth < 2:
+        unknown = False
+        for parent in _wd_claim_ids(ent, "P279")[:5]:
+            sub = await _wd_class_is_film(session, parent, depth + 1)
+            if sub:
+                result = True
+                break
+            if sub is None:
+                unknown = True
+        if not result and unknown:
+            return None
+    _WD_FILM_CACHE[qid] = bool(result)
+    if len(_WD_FILM_CACHE) > _CACHE_MAX:
+        _WD_FILM_CACHE.popitem(last=False)
+    return bool(result)
+
+
+def _wd_years(entity: dict, prop: str = "P577") -> list:
+    """Years of a Wikidata date property (publication date), deprecated statements ignored."""
+    out = []
+    for st in ((entity.get("claims") or {}).get(prop) or []):
+        try:
+            if st.get("rank") == "deprecated":
+                continue
+            y = int(str(st["mainsnak"]["datavalue"]["value"]["time"]).lstrip("+-")[:4])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if y not in out:
+            out.append(y)
+    return out
+
+
+async def _wikidata_film_lookup(session, title: str, year: int):
+    """Cache entry for one title (found / none), or None when Wikidata failed."""
+    hits = _qc_get("wikidata", title)
+    if hits is None:
+        data = await _wikidata_get(session, {"action": "wbsearchentities", "search": title, "language": "en",
+                                             "uselang": "en", "type": "item", "limit": "7"})
+        if data is _TMDB_ERROR:
+            return None
+        hits = [h for h in (data.get("search") or []) if isinstance(h, dict) and h.get("id")]
+        _qc_put("wikidata", title, hits)
+    q = _norm_cmp(title)
+    scored = []
+    for h in hits:
+        match = h.get("match") or {}
+        labels = [h.get("label")] + list(h.get("aliases") or []) + ([match.get("text")] if match.get("type") == "alias" else [])
+        if any(isinstance(n, str) and n and _title_score_movie(q, _norm_cmp(n)) >= 1.0 for n in labels):
+            scored.append(h)                                  # strict: the label / an alias IS the title
+    scored = scored[:3]
+    none = {"source": "wikidata", "id": None, "verdict": "none", "facts": None}
+    if not scored:
+        return none
+    ents = await _wikidata_get(session, {"action": "wbgetentities", "ids": "|".join(h["id"] for h in scored),
+                                         "props": "claims"})
+    if ents is _TMDB_ERROR:
+        return None
+    unknown = False
+    for h in scored:
+        entity = (ents.get("entities") or {}).get(h["id"]) or {}
+        if not any(abs(y - year) <= 1 for y in _wd_years(entity)):
+            continue                                          # the year must agree (an item with no year never matches)
+        for cls in _wd_claim_ids(entity, "P31")[:8]:
+            verdict = await _wd_class_is_film(session, cls)
+            if verdict:
+                return {"source": "wikidata", "id": h["id"], "verdict": "found", "facts": None}
+            if verdict is None:
+                unknown = True
+    return None if unknown else none
+
+
+async def _wikidata_film_for(session, p: dict):
+    """The Wikidata film item (its Q-id) for a movie-like name, or None. The verdict is cached per film
+    (cleaned title + year), "not found" included, so the parts of one film cost one lookup."""
+    year = p.get("year")
+    if not year:
+        return None
+    entry = _show_get(p, "wikidata_film")
+    if entry is None:
+        errored = False
+        for title in (p.get("titles") or p["movie"]["titles"])[:3]:
+            e = await _wikidata_film_lookup(session, title, year)
+            if e is None:
+                errored = True
+                continue
+            if e["verdict"] == "found":
+                entry = e
+                break
+        if entry is None and not errored:
+            entry = {"source": "wikidata", "id": None, "verdict": "none", "facts": None}
+        if entry is not None:
+            _show_put(p, "wikidata_film", entry)
+    return entry["id"] if entry and entry["verdict"] == "found" else None
+
+
+async def _movie_fallbacks(session, tmdb_key: str, p: dict, info: dict, anime_mode: bool):
+    """-> ("found", kind) | ("none", None) | ("error", None) for a movie-like name TMDB did not know.
+    Never raises: a failing layer just means "no evidence"."""
+    try:
+        mv = p["movie"]
+        if mv["variants"] and p.get("year"):
+            match, errored = await _tmdb_movie_variants(session, tmdb_key, p)
+            if match:
+                mid = match.get("id")
+                animated = TMDB_ANIMATION_GENRE_ID in (match.get("genre_ids") or [])
+                kind = "movie"
+                if _is_anime_result(match, "movie"):
+                    kind = "anime"
+                elif anime_mode:
+                    ok, _src, _why, _lst = await _tmdb_anime_confirm(session, match, "movie", mid, animated)
+                    kind = "anime" if ok else "movie"
+                info["tmdb_id"], info["tmdb_media"] = mid, "movie"
+                _movie_note(info, source="tmdb-variant", matched=match.get("title"), tmdb_id=mid)
+                return "found", kind
+            if errored:
+                return "error", None                          # don't guess during an outage
+        if USE_WIKIDATA and USE_WIKIDATA_FILMS and p.get("year"):
+            qid = await _wikidata_film_for(session, p)
+            if qid:
+                _movie_note(info, source="wikidata", wikidata_id=qid)
+                return "found", "movie"
+        return "none", None
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.debug("deep movie fallbacks failed for %r: %s", p.get("clean_title"), e)
+        return "none", None
+
+
 # ---- the confidence score ---------------------------------------------------------
 def _facts_exact(p: dict, facts) -> bool:
     """A name of the file equals a name of the show (after normalising): the cleaned title
@@ -3559,6 +4093,24 @@ def _score_series(p: dict, tmdb=None, tvmaze=None, openai: bool = False, exact: 
     return True, score, sig, "ok"
 
 
+def _series_other_reason(p: dict, reason: str, vouched: bool):
+    """(reason, detail) for info["other_reason"] when the deep series scoring ends in Other.
+    vouched = TMDB / TVmaze / Wikidata / OpenAI knew the title."""
+    low = (reason or "").lower()
+    if low.startswith("sample"):
+        return "extra", reason
+    title = p.get("clean_title") or ((p.get("titles") or [""])[0])
+    if not vouched and p.get("movie"):
+        shown = ", ".join(repr(t) for t in (p["movie"].get("titles") or [title])[:3])
+        year = f" ({p['year']})" if p.get("year") else ""
+        return "not_found", f"no TMDB / Wikidata film match for {shown}{year}"
+    if low.startswith(("course", "adult", "generic")):
+        return "unidentified", reason
+    if not vouched:
+        return "not_found", f"no source knows {title!r}: {reason}"
+    return "unidentified", reason
+
+
 # ---- /autosort entry point: classify_async(..., deep_series=True) ------------------
 async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key: str, use_anilist: bool,
                        anilist_key: str, openai_key: str, info: dict, anime_mode: bool = False) -> str:
@@ -3607,7 +4159,17 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
             source=source, id=ident, score=score, signals=signals, reason=reason, ambiguous=ambiguous,
             title=p.get("clean_title") or p["titles"][0], language=p.get("language"),
             runtime=next((f["runtime"] for f in (tmdb, tvmaze) if f and f.get("runtime")), None))
+        if not ok:
+            _other_note(info, *_series_other_reason(p, reason, bool(tmdb or tvmaze or wikidata or openai)))
         return _finish("series") if ok else "other"
+
+    # what the movie cleaner made of the name (handlers/autosort.py logs it when the file ends in Other)
+    for pp in parsed:
+        if pp.get("movie"):
+            mvi = pp["movie"]
+            _movie_note(info, title=mvi["title"], titles=list(pp.get("titles") or [])[:4], year=pp.get("year"),
+                        languages=list(mvi["languages"]))
+            break
 
     # 0) deep_anime only: an anime CANDIDATE asks AniList (Jikan when AniList failed) BEFORE TMDB
     if anime_mode:
@@ -3618,7 +4180,7 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
                     season=first.get("season") or ap0.get("season"),
                     episode=first.get("episode") or ap0.get("episode"),
                     source="-", verdict=None, anilist="-")
-        if await _anime_first_pass(session, parsed, use_anilist, anilist_key, minutes, info):
+        if await _anime_first_pass(session, parsed, use_anilist, anilist_key, minutes, info, tmdb_key):
             src = info["anime"].get("source") or "anilist"
             sinfo["reason"] = f"{src}: anime (asked before TMDB)"
             if sinfo["looked_series"]:
@@ -3635,6 +4197,9 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
             status, kind = hit["status"], hit["kind"]
         else:
             status, kind = await _tmdb_identify(session, tmdb_key, p, use_anilist, anilist_key, info, anime_mode)
+            if status == "none" and p.get("movie"):
+                # TMDB answered "no such film": spelling variants (Chaadum / Chadum), then Wikidata
+                status, kind = await _movie_fallbacks(session, tmdb_key, p, info, anime_mode)
         if status == "found":
             found = (p, kind, hit)
             break
@@ -3645,7 +4210,7 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
         if anime_mode and kind != "anime":
             await _anime_downgrade_note(session, tmdb_key, info)
         if kind != "series":                       # movie / anime: decided exactly as before
-            sinfo["reason"] = f"tmdb: {kind}"
+            sinfo["reason"] = f"{(info.get('movie') or {}).get('source', 'tmdb')}: {kind}"
             if kind == "anime" and sinfo["looked_series"]:
                 sinfo["to_anime"] = ((hit or {}).get("why")
                                      or (f"tmdb {info.get('tmdb_media')} {info.get('tmdb_id')} says anime"
@@ -4474,9 +5039,51 @@ def _anime_year_conflict(p: dict, media: dict):
     return None
 
 
-async def _anime_first_pass(session, parsed, use_anilist: bool, anilist_key: str, minutes, info: dict) -> bool:
+async def _live_action_twin(session, tmdb_key: str, p: dict, media: dict):
+    """deep_anime rule "a live-action match is never anime", for AniList-FIRST (which answers before TMDB ever
+    sees the file): the text "tmdb tv 123 'Alice in Borderland' is live-action" when TMDB has a title that is
+    EXACTLY the file's title (year +-1 when the file has one) and every such title is live-action (genres known,
+    none is Animation). A TMDB twin that IS animated keeps AniList's verdict, and so does anything unknown
+    (no key, TMDB failed, genres not filled in yet): nothing is guessed. Never raises."""
+    try:
+        if not tmdb_key:
+            return None
+        ap = p.get("anime") or {}
+        title = ap.get("title") or p.get("clean_title") or (p.get("titles") or [""])[0]
+        key = _norm_cmp(title)
+        if not key:
+            return None
+        year = p.get("year") or ap.get("year")
+        mt = "movie" if media.get("format") == "MOVIE" else "tv"
+        name_keys = ("title", "original_title") if mt == "movie" else ("name", "original_name")
+        results = await _tmdb_search(session, mt, title, tmdb_key)
+        if results is _TMDB_ERROR:
+            return None
+        live = None
+        for r in results or []:
+            names = [r.get(k) for k in name_keys if r.get(k)]
+            if not any(_title_score(key, _norm_cmp(n)) >= 1.0 for n in names):
+                continue
+            ry = _year_of(r.get("release_date" if mt == "movie" else "first_air_date"))
+            if year and ry and abs(ry - year) > 1:
+                continue
+            genres = r.get("genre_ids") or []
+            if not genres or TMDB_ANIMATION_GENRE_ID in genres:
+                return None
+            live = live or f"tmdb {mt} {r.get('id')} {names[0]!r} is live-action"
+        return live
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.debug("live-action check failed for %r: %s", p.get("clean_title"), e)
+        return None
+
+
+async def _anime_first_pass(session, parsed, use_anilist: bool, anilist_key: str, minutes, info: dict,
+                            tmdb_key: str = "") -> bool:
     """AniList FIRST for anime candidates. True = an Asian-origin AniList / Jikan match was found and
-    info["anime"] is filled; False = ask TMDB as usual (info["anime"]["anilist"] says what AniList said)."""
+    info["anime"] is filled; False = ask TMDB as usual (info["anime"]["anilist"] says what AniList said).
+    tmdb_key: with a key, an AniList match is dropped when TMDB knows the same title only as live-action."""
     for p in parsed:
         ap = p.get("anime")
         if not ap or not ap.get("candidate") or p.get("extra"):
@@ -4489,6 +5096,11 @@ async def _anime_first_pass(session, parsed, use_anilist: bool, anilist_key: str
         if why:
             a["anilist"] = "year-skip"
             a.setdefault("notes", []).append("anilist-first skipped: " + why)
+            continue
+        live = await _live_action_twin(session, tmdb_key, p, res["media"])
+        if live:
+            a["anilist"] = "live-action-skip"
+            a.setdefault("notes", []).append("anilist-first skipped: " + live)
             continue
         _anime_note(info, source=res["source"], verdict="anime", **_anime_media_fields(res["media"], res["source"]))
         if res["d"].get("dur"):
