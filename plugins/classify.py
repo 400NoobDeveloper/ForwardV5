@@ -107,6 +107,21 @@ Steps for a video file:
      info["other_reason"] / info["other_detail"] (read by handlers/autosort.py).
      See "deep MOVIE identification" in the middle of this file.
 
+ 13. /autosort only (deep_series=True): identification has to be PROVEN, not guessed.
+     a. Anime: "Episode N" without a season and dub words only raise the PRIORITY of an AniList lookup. The verdict
+        needs an authority - an AniList match with Asian origin, the Fribb anime list, TMDB Animation + Asian
+        origin, or Jikan when AniList failed. AniList "not found" is an answer: the file stays a series / movie.
+        The entry must also FIT the file: "Episode 25" is not a 2-episode OVA that merely shares the title.
+     b. Pipe names "SHOW | Episode N | Original title | Dubbed in English | CODE 1080p25.0fps 3843": the show is the
+        segment before "Episode N", the original title is the second candidate, junk segments never are one.
+     c. Series signals: season packs ("S01 Combined / Complete"), "1of4" / "Part 1 of 4" / "S01 EP01" markers and
+        TV-source tags (PDTV / HDTV / DSR / TVRip / DVBS). Broadcaster prefixes (Ch5, BBC ...) and site tags
+        (MVGroup.org, torrentgalaxy.to) are cut out of the title.
+     d. A film / show TMDB's own title search does not know is searched with spelling variants, then TMDB's year +
+        language pool, then IMDb suggestions (OMDb with OMDB_API_KEY), then Wikidata (TVmaze for shows).
+     e. Education is only a candidate: a source that knows the show wins over soft course words ("Lessons") and a
+        bracketed year; with no confirmation, course signals send the file to education instead of other.
+
 Non-video routing (pdf / image / audio / files / other) is extension
 based, exactly as before.
 
@@ -136,7 +151,7 @@ import logging
 import unicodedata
 from collections import OrderedDict
 from difflib import SequenceMatcher
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +210,9 @@ SKIP_CATEGORIES = (UNIDENTIFIED, TMDB_UNAVAILABLE)
 PDF_EXTENSIONS = {".pdf"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".tiff"}
 AUDIO_EXTENSIONS = {".mp3", ".flac", ".m4a", ".wav", ".ogg", ".opus", ".aac"}
+# Only /autosort (classify_async(deep_series=True)) knows these audio formats too, so a ".ac3" / ".dts" soundtrack goes to
+# Audio instead of Other; /fwd and its category filters keep AUDIO_EXTENSIONS exactly as before.
+DEEP_AUDIO_EXTENSIONS = AUDIO_EXTENSIONS | {".ac3", ".eac3", ".dts", ".mka", ".aiff", ".wma", ".amr", ".ape", ".wv", ".m4b"}
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".webm", ".mov", ".wmv", ".ts", ".m4v", ".flv"}
 # Archives. Only /autosort (classify_async(deep_series=True)) files them under "files"
 # ("Files (Unidentified)"); everywhere else they stay "other" exactly as before. Split-archive
@@ -348,7 +366,60 @@ _SEG_NOISE_RE = re.compile(
 )
 
 
-def _pipe_titles(name: str) -> list:
+# Deep pipe names ("SHOW | Episode 25 | Original Title | Dubbed in English | GK11 1080p25.0fps 3843.mp4"): a segment made
+# only of these words, a number or a channel code ("GK11") is never a title. PIPE_JUNK_WORDS adds more, comma separated.
+_PIPE_JUNK_WORDS = {
+    "dubbed", "dub", "subbed", "sub", "subs", "subtitles", "subtitle", "english", "eng", "hindi", "urdu", "tamil", "telugu",
+    "malayalam", "kannada", "bengali", "bangla", "punjabi", "marathi", "gujarati", "official", "full", "episode", "episodes",
+    "ep", "part", "parts", "new", "latest", "complete", "whole", "hd", "uhd", "series", "serial", "show", "web", "live",
+    "moments", "moment", "drama", "dramas", "awards", "award", "performances", "performance", "highlights", "highlight",
+    "promo", "scenes", "scene", "clips", "clip", "songs", "song", "interview", "interviews", "video", "videos", "channel",
+    "audio", "in", "with", "and", "the", "of", "a", "to",
+    *[w.strip().lower() for w in os.environ.get("PIPE_JUNK_WORDS", "").split(",") if w.strip()],
+}
+_PIPE_CODE_RE = re.compile(r"^[A-Za-z]{1,4}\d{1,4}$")
+_EP_SEG_RE = re.compile(r"^\W*(?:(?:full|latest|new|complete|whole)\s+)?(?:episodes?|ep|epi)\b\.?\s*#?\s*0*\d{0,4}\W*$",
+                        re.IGNORECASE)
+
+
+def _pipe_junk(seg: str) -> bool:
+    words = re.findall(r"[^\W_]+", seg or "", re.UNICODE)
+    if not words or (len(words) == 1 and _PIPE_CODE_RE.match(words[0])):
+        return True
+    return all(w.lower() in _PIPE_JUNK_WORDS or w.isdigit() for w in words)
+
+
+def _pipe_titles_deep(name: str) -> list:
+    """Deep (/autosort) title candidates of a pipe-separated name, best first. The SHOW is the last real segment
+    BEFORE the "Episode N" segment, the segments AFTER it are alternate (original) titles, earlier ones are headlines;
+    junk segments (see _PIPE_JUNK_WORDS) and the downloader tail ("1080p25.0fps 3843") never become titles.
+    "FORBIDDEN LOVE | Episode 25 | Rabba Ishq Na Hove | Dubbed in English | GK11 1080p25.0fps 3843.mp4"
+    -> ["FORBIDDEN LOVE", "Rabba Ishq Na Hove"]. A name with no "Episode N" segment keeps _pipe_titles()'s order
+    (later, short, comma-free segments first) with the junk segments left out."""
+    stem = _strip_release_noise(_VIDEO_EXT_TAIL_RE.sub("", name))
+    raw = [s.strip() for s in re.split(r"\s*[|｜]\s*", stem)]
+    ep_idx = next((i for i, s in enumerate(raw) if _EP_SEG_RE.match(s)
+                   or re.fullmatch(_DEEP_EP_RE.pattern, s, re.IGNORECASE)), None)
+    segs = []
+    for idx, seg in enumerate(raw):
+        seg = _EDGE_JUNK_RE.sub("", re.sub(r"\s{2,}", " ", _SEG_NOISE_RE.sub(" ", seg))).strip()
+        if idx == ep_idx or len(re.findall(r"\w", seg)) < 2 or _pipe_junk(seg):
+            continue
+        segs.append((idx, seg[:80]))
+    if ep_idx is not None:
+        before = [t for t in segs if t[0] < ep_idx]
+        after = [t for t in segs if t[0] > ep_idx]
+        ordered = (before[-1:] + after + before[:-1])
+    else:
+        ordered = sorted(segs, key=lambda t: (("," in t[1]) or ("&" in t[1]), len(t[1].split()) > 7, t[0] == 0, t[0]))
+    out = []
+    for _idx, seg in ordered:
+        if seg not in out:
+            out.append(seg)
+    return out
+
+
+def _pipe_titles(name: str, deep: bool = False) -> list:
     """Title candidates from a pipe-separated name, best first.
 
     "Arjun ne kyun kiya... | Kkoi Dil Mein Hai | Full Episode | Episode 29"
@@ -356,8 +427,10 @@ def _pipe_titles(name: str) -> list:
 
     The show name is usually NOT the first segment (that is the episode
     headline), so later, short, comma-free segments are tried first; cast
-    lists ("A, B") and long headlines go last.
+    lists ("A, B") and long headlines go last. deep=True (/autosort): see _pipe_titles_deep().
     """
+    if deep:
+        return _pipe_titles_deep(name)
     stem = _VIDEO_EXT_TAIL_RE.sub("", name)
     segments = []
     for idx, seg in enumerate(re.split(r"\s*[|｜]\s*", stem)):
@@ -814,6 +887,70 @@ def _deep_prepare(name: str) -> dict:
     return {"name": _EDGE_JUNK_RE.sub("", name), "date": air_date, "platforms": platforms}
 
 
+# ---- deep parse gaps (/autosort only): counted episodes, season packs, TV-source rips, broadcaster / site tags ----
+#   "1of4" / "1 of 4" / "Part 1 of 4" / "Ep 1/4"   -> "Episode 1": a normal episode marker for everything downstream
+#   "S01 Combined" / "Complete Season 1" / ...      -> a SEASON PACK: strong series marker, the pack words leave the title
+#   PDTV / HDTV / DSR / TVRip / DVBS                -> TV-source rip: a positive series signal, out of the title
+#   leading "Ch5." / "BBC " / "ITV " / "NatGeo "   -> out of the title (BROADCASTER_PREFIXES adds more, comma separated)
+#   "...AAC.MVGroup.org", "(2025) (2025)"           -> site tag / duplicate year out of the name
+# A counted episode, a TV-source rip or a broadcaster prefix also means "not anime-style naming" (see "serial" below).
+_BROADCASTERS = ["ch5", "ch4", "c5", "c4", "channel 5", "channel 4", "channel5", "channel4", "bbc", "bbc one", "bbc two",
+                 "bbc three", "bbc four", "bbc1", "bbc2", "bbc3", "bbc4", "itv", "itv1", "itv2", "itv3", "itv4", "itvx",
+                 "natgeo", "nat geo", "natgeo wild", "national geographic", "pbs", "cnbc", "more4", "stv"]
+_BROADCASTERS += [b.strip().lower() for b in os.environ.get("BROADCASTER_PREFIXES", "").split(",") if b.strip()]
+_BCAST_RE = re.compile(
+    r"^\s*(" + "|".join(re.escape(b).replace(r"\ ", r"[\s._-]?") for b in sorted(set(_BROADCASTERS), key=len, reverse=True))
+    + r")[\s._-]+(?=\S)", re.IGNORECASE)
+_TV_SRC_RE = re.compile(r"(?<![A-Za-z0-9])(?:pdtv|dsr(?:ip)?|tv[\s._-]?rip|dvb[\s._-]?[st]|sat[\s._-]?rip|hdtv)(?![A-Za-z0-9])",
+                        re.IGNORECASE)
+_EP_OF_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:(?P<lead>part|pt|episode|ep)\.?[\s._-]*)?0*(?P<n>\d{1,2})(?:[\s._-]*of[\s._-]*|(?P<sl>/))0*(?P<m>\d{1,2})"
+    r"(?![A-Za-z0-9/])", re.IGNORECASE)
+_PACK_WORD_RE = re.compile(r"(?<![A-Za-z0-9])(?:combined|complete|full|entire|all[\s._-]*(?:episodes?|eps?))(?![A-Za-z0-9])",
+                           re.IGNORECASE)
+_SITE_TAIL_RE = re.compile(
+    r"(?<=[\s._-])[A-Za-z0-9][A-Za-z0-9-]{1,30}\.(?:org|com|net|to|me|cc|co|in|xyz|ws|lol|vip|site|info|biz|club|link|fun|top|ink)"
+    r"(?![A-Za-z0-9])", re.IGNORECASE)
+_DUP_YEAR_RE = re.compile(r"([\(\[]\s*(?:19|20)\d{2}\s*[\)\]])(?:[\s._-]*\1)+")
+
+
+def _deep_pre(name: str):
+    """-> (name, flags): the deep clean-up above. flags = {"broadcaster", "tv_source", "ep_of", "pack", "serial"}.
+    Runs BEFORE the movie / series name machinery sees the name. Pure string work; never raises."""
+    flags = {"broadcaster": None, "tv_source": False, "ep_of": None, "pack": False, "serial": False}
+    try:
+        stem = _clean_name(_strip_release_noise(name))
+        m = _VIDEO_EXT_END_RE.search(stem)
+        stem, ext = (stem[:m.start()], m.group(0)) if m else (stem, "")
+        bm = _BCAST_RE.match(stem)
+        if bm and len(re.findall(r"[^\W_]", stem[bm.end():])) >= 2:
+            flags["broadcaster"], stem = re.sub(r"[\s._-]+", "", bm.group(1).lower()), stem[bm.end():]
+        if _TV_SRC_RE.search(stem):
+            flags["tv_source"], stem = True, _TV_SRC_RE.sub(" ", stem)
+        for mm in _EP_OF_RE.finditer(stem):
+            n, total = int(mm.group("n")), int(mm.group("m"))
+            if mm.group("sl") and not mm.group("lead"):
+                continue                                          # "1/4" alone is a fraction / date, not an episode
+            if 1 <= n <= total <= 99 and total >= 2:
+                flags["ep_of"] = (n, total)
+                stem = stem[:mm.start()] + f" Episode {n} " + stem[mm.end():]
+                break
+        if (_SEASON_RE.search(stem) and _PACK_WORD_RE.search(stem) and not _DEEP_EP_RE.search(stem)
+                and not flags["ep_of"]):
+            flags["pack"], stem = True, _PACK_WORD_RE.sub(" ", stem)
+        stem = _DUP_YEAR_RE.sub(r"\1", stem)
+        tech = _TECH_START_RE.search(stem)                         # a site tag only counts after the technical tail starts
+        if tech:
+            stem = stem[:tech.start()] + _SITE_TAIL_RE.sub(" ", stem[tech.start():])
+        stem = re.sub(r"([._\s])[._\s]+", r"\1", stem)
+        stem = re.sub(r"^[\s._\-–—:|~]+|[\s._\-–—:|~]+$", "", stem)
+        flags["serial"] = bool(flags["broadcaster"] or flags["tv_source"] or flags["ep_of"])
+        return (stem + ext) if stem else name, flags
+    except Exception as e:                                        # never raise from an identification layer
+        logger.debug("deep pre-clean failed on %r: %s", name, e)
+        return name, {"broadcaster": None, "tv_source": False, "ep_of": None, "pack": False, "serial": False}
+
+
 def _deep_extra(stem: str) -> bool:
     """sample / trailer / promo / recap ... anywhere but as the FIRST word of a title
     ("Trailer Park Boys S01E01" is fine; "Promo - Show Ep 5" is not)."""
@@ -1137,6 +1274,72 @@ def _translit_keys(text: str) -> set:
     return {_norm_cmp(v).replace(" ", "") for v in [text, *_translit_variants(text)] if v}
 
 
+def _translit_expand(title: str) -> list:
+    """The OTHER direction of _translit_variants(): a -> aa, i -> ee, u -> oo (the last single vowel, then every one),
+    t -> th, d -> dh, v <-> w, and the last single consonant between vowels doubled. "Madharasi" -> "Madharaasi"."""
+    out = []
+
+    def last(pat, repl):
+        ms = list(re.finditer(pat, title, flags=re.IGNORECASE))
+        if ms:
+            m = ms[-1]
+            out.append(title[:m.start()] + _case_like(m.group(0), repl) + title[m.end():])
+
+    def every(pat, repl):
+        new = re.sub(pat, lambda m: _case_like(m.group(0), repl), title, flags=re.IGNORECASE)
+        if new != title:
+            out.append(new)
+
+    for pat, repl in ((r"(?<![aeiou])a(?![aeiou])", "aa"), (r"(?<![aeiou])i(?![aeiou])", "ee"),
+                      (r"(?<![aeiou])u(?![aeiou])", "oo")):
+        last(pat, repl)
+        every(pat, repl)
+    for pat, repl in ((r"(?<![t])t(?![thr])", "th"), (r"(?<![d])d(?![dhr])", "dh"), (r"v", "w"), (r"w", "v")):
+        every(pat, repl)
+    ms = list(re.finditer(r"(?<=[aeiou])([bcdfgjklmnprstyz])(?=[aeiou])", title, flags=re.IGNORECASE))
+    if ms:                                                    # the last single consonant between vowels, doubled
+        m = ms[-1]
+        out.append(title[:m.end()] + m.group(1) + title[m.end():])
+    return out
+
+
+def _title_variants(title: str, translit: bool = True) -> list:
+    """Query variants of a film title for the TMDB token search, most likely first, never the title itself:
+      1. spaces joined between short adjacent words ("Radhe krishna" -> "Radhekrishna", "1980 lo Radhe krishna" ->
+         "1980 lo Radhekrishna"); a short 2-3 word title joined whole
+      2. a glued compound split ("RadheKrishna" -> "Radhe Krishna", "Kalki2898" -> "Kalki 2898")
+      3. transliteration spellings (only with translit=True: the name says an Indian language or the title looks
+         transliterated), shortened (aa -> a, th -> t ...) and lengthened (a -> aa, t -> th ...)
+      4. without a leading number ("1980 lo Radhe krishna" -> "lo Radhe krishna")
+      5. the first three words of a long title (accepted only when the FULL title still matches the result)"""
+    out, seen = [], {_norm_cmp(title)}
+
+    def add(t):
+        t = re.sub(r"\s{2,}", " ", t or "").strip()
+        k = _norm_cmp(t)
+        if k and k not in seen and len(re.findall(r"[^\W_]", t)) >= 2:
+            seen.add(k)
+            out.append(t)
+
+    words = title.split()
+    for i in range(len(words) - 1):
+        a, b = words[i], words[i + 1]
+        if (a.isalpha() and b.isalpha() and 3 <= len(a) <= 8 and 3 <= len(b) <= 8
+                and a.lower() not in _STOP_ENDINGS and b.lower() not in _STOP_ENDINGS):
+            add(" ".join(words[:i] + [a + b] + words[i + 2:]))
+    if 2 <= len(words) <= 3 and all(w.isalpha() for w in words):
+        add("".join(words))
+    add(re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])", " ", title))
+    if translit:
+        for v in _translit_variants(title) + _translit_expand(title):
+            add(v)
+    if len(words) > 2 and words[0].isdigit():
+        add(" ".join(words[1:]))
+    if len(words) >= 5:
+        add(" ".join(words[:3]))
+    return out
+
+
 def _movie_info(raw: str) -> dict:
     """Pure clean-up of one release name for deep MOVIE identification (no network, never raises).
       title        the cut-out title ("M S M", "2012", "Kalaratri")        year   release year or None
@@ -1223,8 +1426,8 @@ def _movie_info(raw: str) -> dict:
             titles += ["".join(letters), ".".join(letters)]  # "MSM", "M.S.M"
         out["titles"] = list(dict.fromkeys(t for t in titles if t))
         out["usable"] = bool(len(re.findall(r"[^\W_]", title)) >= 2 and (not out["digits"] or out["year"]))
-        if out["usable"] and out["year"] and not out["digits"] and (out["indian"] or _TRANSLIT_HINT_RE.search(title)):
-            out["variants"] = _translit_variants(title)
+        if out["usable"] and out["year"] and not out["digits"]:
+            out["variants"] = _title_variants(title, translit=bool(out["indian"] or _TRANSLIT_HINT_RE.search(title)))
     except Exception as e:                                    # never raise from an identification layer
         logger.debug("movie name clean-up failed on %r: %s", raw, e)
         out["usable"] = False
@@ -1295,6 +1498,9 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: 
         raw = _url_decode(raw)
     anime = bool(anime and deep)
     name = _strip_split_suffix(raw) if _is_split_part(raw) else raw
+    pre = {}
+    if deep:
+        name, pre = _deep_pre(name)               # counted episodes, season packs, TV-source tags, broadcaster / site tags
     mv = _movie_info(name) if deep else None      # deep MOVIE clean-up (pure string work), attached at the end
     if anime:
         m_ext = _VIDEO_EXT_END_RE.search(name)
@@ -1338,6 +1544,7 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: 
     if prep:
         # deep: also "E105" / "1x05" and date-named episodes (\"12th Nov 2026\")
         strong_episode = strong_episode or bool(_DEEP_EP_RE.search(name)) or prep["date"] is not None
+        strong_episode = strong_episode or bool(pre.get("pack"))        # "S01 Combined" is explicit series naming
 
     guess_titles = []
     for t in (anime_title, g.get("title"), g.get("alternative_title")):
@@ -1361,7 +1568,7 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: 
     if not titles and _PIPE_RE.search(name):
         # "Headline | Show | Full Episode | Episode N": guessit's title is
         # the headline, so build candidates from the segments instead.
-        titles = _pipe_titles(name)
+        titles = _pipe_titles(name, deep=bool(prep))
         max_titles = 4
     if not titles:
         titles = list(guess_titles)
@@ -1383,11 +1590,12 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: 
     # Anime-style naming: fansub group tag, or an episode number with no
     # season (\"One.Piece.E1090\", \"Naruto Shippuden - 123\"). Deep: a date-named
     # or channel-tagged episode (\"Ghar Ki Baat 12 Nov 2026\", \"Star Plus\") is a TV serial.
-    serial_style = bool(prep and (prep["date"] or prep["platforms"]))
+    serial_style = bool(prep and (prep["date"] or prep["platforms"] or pre.get("serial")))
     season_no, episode_no = _episode_numbers(name, g) if prep else (None, None)
     anime_hint = bool(anime_title) or (bool(is_episode) and not (g.get("season") or season_no) and not serial_style)
     release_group = bool(g.get("release_group")) or bool(norm and norm["group_removed"])
-    weak = not (any(g.get(f) for f in _RELEASE_SIGNAL_FIELDS) or release_group) and not anime_title
+    weak = (not (any(g.get(f) for f in _RELEASE_SIGNAL_FIELDS) or release_group) and not anime_title
+            and not pre.get("tv_source"))                     # a TV-source tag (PDTV / HDTV ...) is a release signal
 
     extra = False
     if check_extra:
@@ -1402,7 +1610,11 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: 
     part_weak = bool(prep and _PART_RE.search(name) and not (g.get("year") or release_group))
     signals = []
     if strong_episode:
-        signals.append("date" if date_ep else "marker")
+        signals.append("date" if date_ep else ("pack" if pre.get("pack") else "marker"))
+    if pre.get("tv_source"):
+        signals.append("tv-source")
+    if pre.get("broadcaster"):
+        signals.append("bcast:" + pre["broadcaster"])
     if prep and prep["platforms"]:
         signals.append("plat:" + prep["platforms"][0])
     if part_weak:
@@ -1430,6 +1642,10 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: 
         "extra": extra,
         # explicit "Episode N" / "S01E02" / "Season N" / "S01" in this name
         "series_like": bool(strong_episode or _SEASON_RE.search(name)),
+        # deep-only: a season pack ("S01 Combined"), a TV-source rip (PDTV / HDTV ...), "not anime-style naming"
+        "season_pack": bool(pre.get("pack")),
+        "tv_source": bool(pre.get("tv_source")),
+        "serial_style": serial_style,
         # deep-only (neutral defaults otherwise)
         "clean_title": (shape["clean_title"] if shape else (titles[0] if prep else None)),
         "language": shape["language"] if shape else None,
@@ -1476,7 +1692,8 @@ def _early_category(message, archives_as_files: bool = False):
     that still need title-based identification.
 
     archives_as_files (only /autosort's deep mode passes True): a zip / rar / 7z / ... file is
-    "files" instead of "other". Default False, so /fwd, the whitelists and /autosortai are unchanged."""
+    "files" instead of "other", and the extra audio formats (DEEP_AUDIO_EXTENSIONS: .ac3 .dts .mka ...) are
+    "audio". Default False, so /fwd, the whitelists and /autosortai are unchanged."""
     if getattr(message, "photo", None):
         return "image", [], False
 
@@ -1497,7 +1714,7 @@ def _early_category(message, archives_as_files: bool = False):
         return "pdf", [], False
     if ext in IMAGE_EXTENSIONS:
         return "image", [], False
-    if ext in AUDIO_EXTENSIONS:
+    if ext in (DEEP_AUDIO_EXTENSIONS if archives_as_files else AUDIO_EXTENSIONS):
         return "audio", [], False
 
     is_split = _is_split_part(filename)
@@ -1529,7 +1746,12 @@ def _early_other_reason(message, early: str):
         return "archive", "archive or split part"
     filename = get_filename(message)
     if filename:
-        return "other_type", f"extension {os.path.splitext(filename)[1].lower() or '-'} is not video / pdf / image / audio / archive"
+        ext = os.path.splitext(filename)[1].lower() or "-"
+        if ext in (".srt", ".ass", ".ssa", ".vtt", ".sub"):
+            return "other_type", f"subtitle file ({ext}) stays in Other"
+        if ext in (".txt", ".nfo"):
+            return "other_type", f"text / info file ({ext}) stays in Other"
+        return "other_type", f"extension {ext} is not video / pdf / image / audio / archive"
     if getattr(message, "video", None) is not None:
         return "unidentified", "video without a file name or a usable caption"
     return "other_type", "no file name (not a video, photo, audio or document)"
@@ -1727,6 +1949,8 @@ async def _tmdb_search(session, media_type: str, query: str, tmdb_key: str, year
     params = {"api_key": tmdb_key, "query": query, "include_adult": "false"}
     if year and media_type == "movie":
         params["year"] = year
+    elif year and media_type == "tv":
+        params["first_air_date_year"] = year      # only the deep /autosort layers pass a year for TV
 
     for attempt in range(TMDB_RETRIES):
         try:
@@ -1801,10 +2025,24 @@ query ($search: String) {
 _ANILIST_CACHE: "OrderedDict" = OrderedDict()   # normalized query -> results
 _anilist_lock = None
 _anilist_last_call = 0.0
+_anilist_warn_at = 0.0            # loop time of the last AniList WARNING: repeated errors are warned once a minute
+
+
+def _anilist_note(query: str, status, count, started: float) -> None:
+    """ONE INFO line per AniList request that went out (query, HTTP status, number of results, milliseconds). A failed
+    request (count None) is also a WARNING, but at most once a minute, so a dead AniList cannot flood the log."""
+    global _anilist_warn_at
+    now = asyncio.get_event_loop().time()
+    logger.info("AniList request: query=%r status=%s results=%s ms=%d",
+                query, status, "error" if count is None else count, int((now - started) * 1000))
+    if count is None and (not _anilist_warn_at or now - _anilist_warn_at >= 60):
+        _anilist_warn_at = now
+        logger.warning("AniList is failing (status %s for %r): anime checks use Jikan meanwhile; "
+                       "repeated AniList errors are logged once a minute", status, query)
 
 
 async def _anilist_search(session, query: str, anilist_key: str = ""):
-    """List of AniList media dicts ([] = nothing found) or _TMDB_ERROR."""
+    """List of AniList media dicts ([] = nothing found) or _TMDB_ERROR. Each request is logged once (_anilist_note)."""
     global _anilist_lock, _anilist_last_call
     if aiohttp is None:
         return _TMDB_ERROR
@@ -1820,6 +2058,7 @@ async def _anilist_search(session, query: str, anilist_key: str = ""):
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if anilist_key:                       # optional per-user token (/settings -> AniList)
         headers["Authorization"] = f"Bearer {anilist_key}"
+    started, status = asyncio.get_event_loop().time(), "-"
     for attempt in range(ANILIST_RETRIES):
         async with _anilist_lock:        # one request at a time + spacing
             loop = asyncio.get_event_loop()
@@ -1832,6 +2071,7 @@ async def _anilist_search(session, query: str, anilist_key: str = ""):
                     timeout=aiohttp.ClientTimeout(total=ANILIST_TIMEOUT_SECONDS),
                 ) as resp:
                     _anilist_last_call = loop.time()
+                    status = resp.status
                     if resp.status == 429:
                         try:
                             retry = int(resp.headers.get("Retry-After", 5))
@@ -1843,21 +2083,26 @@ async def _anilist_search(session, query: str, anilist_key: str = ""):
                         await asyncio.sleep(1 + attempt)
                         continue
                     if resp.status != 200:
+                        _anilist_note(query, status, None, started)
                         return _TMDB_ERROR
                     data = await resp.json()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.debug("AniList lookup failed for %r: %s", query, e)
+                status = type(e).__name__
                 await asyncio.sleep(1 + attempt)
                 continue
         if data.get("errors") and not data.get("data"):
+            _anilist_note(query, status, None, started)
             return _TMDB_ERROR
         results = (((data.get("data") or {}).get("Page") or {}).get("media")) or []
+        _anilist_note(query, status, len(results), started)
         _ANILIST_CACHE[ck] = results
         if len(_ANILIST_CACHE) > _CACHE_MAX:
             _ANILIST_CACHE.popitem(last=False)
         return results
+    _anilist_note(query, status, None, started)
     return _TMDB_ERROR
 
 
@@ -2183,6 +2428,8 @@ async def _tmdb_identify_core(session, tmdb_key: str, p: dict, anime_mode: bool 
     # Episode / season naming (this name, or any other name of the same file:
     # see "series_like" in classify_async) is only ever looked up as TV.
     order = ["tv"] if (p["is_episode"] or p.get("series_like")) else ["movie", "tv"]
+    if p.get("tv_source") and order == ["movie", "tv"]:
+        order = ["tv", "movie"]           # deep: PDTV / HDTV / DSR / TVRip is a TV recording - look it up as a show first
     if p.get("year_required"):
         order = ["movie"]                 # deep movie name that is only a number ("2012"): films only, year must agree
     scorer = _title_score_movie if p.get("movie") else None       # deep movie names only
@@ -2922,6 +3169,7 @@ SERIES_REQUIRE_THUMB = os.environ.get("SERIES_REQUIRE_THUMB", "1").strip().lower
 # counts half a marker: guessit also reads bare numbers ("Show 105") that way.
 # "Part N" is never an episode marker (film sequels use it).
 _W_MARKER, _W_WEAK_EPISODE = 4, 2
+_W_TV_SOURCE = 2                 # PDTV / HDTV / DSR / TVRip / DVBS in the name: a TV recording (a positive series signal)
 _W_TMDB, _W_TMDB_EXACT = 3, 1
 _W_TVMAZE, _W_AGREE = 3, 1
 _W_WIKIDATA = 2                  # Wikidata knows it as a TV-type item (only asked when TMDB and TVmaze do not)
@@ -3395,7 +3643,7 @@ def _tv_rank(results, cand: dict, p: dict) -> list:
     return rows
 
 
-def _tv_choose(rows, p: dict) -> dict:
+def _tv_choose(rows, p: dict, proven=None) -> dict:
     """Pick one of the matching TV results.
 
     Best title score wins; among results within 0.02 of it the order is: language of the show
@@ -3403,6 +3651,8 @@ def _tv_choose(rows, p: dict) -> dict:
     year, votes. A franchise with regional versions (Bigg Boss ...) whose language is NOT
     known and whose equally good matches are different-language versions is AMBIGUOUS: the
     most voted one is taken as the generic franchise match (still a series), flagged.
+    proven (deep_anime only): the ids among the tie that an anime list confirms. Then naming alone ("Episode N"
+    without a season) no longer prefers the anime sibling - only a confirmed one is preferred.
     -> {"chosen", "tie", "ambiguous", "lang_ok"}"""
     lang, hint = p.get("language"), bool(p.get("anime_hint"))
     best = max(e for _r, e, _raw in rows)
@@ -3410,8 +3660,9 @@ def _tv_choose(rows, p: dict) -> dict:
 
     def key(r):
         ry = _year_of(r.get("first_air_date"))
+        anime_pref = (r.get("id") in proven) if proven is not None else (hint and _is_anime_result(r, "tv"))
         return (1 if lang and r.get("original_language") == lang else 0,
-                1 if hint and _is_anime_result(r, "tv") else 0,
+                1 if anime_pref else 0,
                 1 if (p.get("year") and ry == p["year"]) else 0,
                 r.get("vote_count") or 0)
 
@@ -3449,7 +3700,16 @@ async def _tmdb_tv_show(session, tmdb_key: str, p: dict, anime_mode: bool = Fals
                 rows = [(alt, 1.0, 1.0)]
         if not rows:
             continue
-        pick = _tv_choose(rows, p)
+        proven = None
+        if anime_mode and p.get("anime_hint") and not (p.get("anime_tag") or (p.get("anime") or {}).get("strong")):
+            # deep_anime: the name only LOOKS anime-ish (episode without a season, dub word): it must not decide
+            # between a live-action and an animated show with the same title - an anime-list hit does
+            top = max(e for _r, e, _raw in rows)
+            proven = set()
+            for r, e, _raw in rows:
+                if e >= top - 0.02 and r.get("id") and _is_anime_result(r, "tv") and await _anime_list_lookup(session, "tv", r["id"]):
+                    proven.add(r["id"])
+        pick = _tv_choose(rows, p, proven)
         chosen, ambiguous, lang_ok = pick["chosen"], pick["ambiguous"], pick["lang_ok"]
         distinct = {r.get("id"): r for r in pick["tie"]}
         if len(distinct) >= 2 and p.get("episode_title") and p.get("season"):
@@ -3694,16 +3954,28 @@ async def _wikidata_facts_for(session, p: dict):
 # ---- deep MOVIE identification: what happens when TMDB answered "not found" -----------------------------------------
 # Only for MOVIE-LIKE names (p["movie"], see _movie_info()) in /autosort's deep mode, and only after the normal
 # TMDB search of the cleaned titles found nothing (TMDB reachable, no match). In this order:
-#   1. TRANSLITERATION VARIANTS ("Chaadum" -> "Chadum"): TMDB is searched with each variant, and a result counts
-#      ONLY when the file has a year AND the result's release year agrees (+-1) AND the title equals the file's
-#      title in some spelling variant AND the file says Indian language (Mal / Hin / Malayalam ...) or TMDB lists the
-#      film in an Indian original language. So a variant can never match a wrong film.
-#   2. WIKIDATA, strict: the item's label / alias equals the title, its publication year (P577) agrees (+-1) and one
+#   1. QUERY VARIANTS ("Radhe krishna" -> "Radhekrishna", "Madharasi" -> "Madharaasi", "Chaadum" -> "Chadum"): TMDB is
+#      searched with each variant (with the year, then one /search/multi), and a result counts ONLY when the file has a
+#      year AND the result's release year agrees (+-1) AND the title key matches (_ext_rank()). So a variant can never
+#      match a wrong film, and a film with few votes is accepted when year and language agree.
+#   2. YEAR + LANGUAGE POOL: TMDB's /discover pages of that year in hi / ta / te / ml / kn / bn / mr / pa, compared locally.
+#   3. IMDb suggestions (OMDb too when OMDB_API_KEY is set): same title, same year (+-1), same type; the tt id is resolved
+#      with TMDB /find.
+#   4. WIKIDATA, strict: the item's label / alias equals the title, its publication year (P577) agrees (+-1) and one
 #      of its "instance of" classes is a FILM class. No Q-id is trusted blindly: a class is a film class when its
 #      English label is "film" (Q11424) / "<genre> film" / "feature film", or one of its "subclass of" parents is.
-# Env vars (all optional):  MOVIE_VARIANT_SEARCHES=4  variants searched per film (0 = off)
+# The verdict ("found" / "none") of the whole chain is cached per film (cleaned title + year); a network error is never cached.
+# Env vars (all optional):  MOVIE_MAX_SEARCHES=6      TMDB query-variant searches per distinct title (0 = off;
+#                                                     MOVIE_VARIANT_SEARCHES is the old name of the same setting)
+#                           MOVIE_POOL_PAGES=5        /discover pages per year + media + language (0 = off)
+#                           MOVIE_FUZZY_MIN=0.9       closest-title score that also needs an Indian language on both sides
+#                           USE_IMDB_SUGGEST=1        IMDb suggestions        OMDB_API_KEY=  OMDb (asked only when set)
 #                           USE_WIKIDATA_FILMS=1      Wikidata for films (also needs USE_WIKIDATA=1)
-MOVIE_VARIANT_SEARCHES = max(0, min(8, int(_env_float("MOVIE_VARIANT_SEARCHES", 4))))
+MOVIE_MAX_SEARCHES = max(0, min(10, int(_env_float("MOVIE_MAX_SEARCHES", _env_float("MOVIE_VARIANT_SEARCHES", 6)))))
+MOVIE_POOL_PAGES = max(0, min(10, int(_env_float("MOVIE_POOL_PAGES", 5))))     # /discover pages per year + media + language (0 = off)
+MOVIE_FUZZY_MIN = _env_float("MOVIE_FUZZY_MIN", 0.9)       # fuzzy title key score that needs an Indian-language match too
+USE_IMDB_SUGGEST = os.environ.get("USE_IMDB_SUGGEST", "1").strip().lower() not in ("0", "false", "no")
+OMDB_API_KEY = os.environ.get("OMDB_API_KEY", "").strip()   # OMDb is only asked when this is set
 USE_WIKIDATA_FILMS = os.environ.get("USE_WIKIDATA_FILMS", "1").strip().lower() not in ("0", "false", "no")
 _INDIAN_LANGS = {"hi", "ml", "ta", "te", "kn", "mr", "bn", "pa", "gu", "bho", "or", "as", "ur"}
 _WD_FILM_NOT_WORDS = ("series", "festival", "studio", "character", "score", "award", "genre", "franchise",
@@ -3719,31 +3991,326 @@ def _movie_note(info, **kw) -> dict:
     return m
 
 
-async def _tmdb_movie_variants(session, tmdb_key: str, p: dict):
-    """-> (result | None, errored): the TMDB movie that carries one of the transliteration variants of the file's
-    title, with the year (+-1) and Indian-language conditions described above."""
-    mv, year = p["movie"], p.get("year")
-    if not year or not mv["variants"] or MOVIE_VARIANT_SEARCHES <= 0:
+# ---- the extra layers below: shared rules and helpers (all /autosort deep mode, none of them ever raises) ----------
+# A hit must agree with the file's YEAR (+-1) and TYPE. "Not found" is a real answer; a network error means "unknown" (no
+# guess, no exception). Every extra source is throttled, cached and has an 8 s timeout. Titles are compared LOCALLY with
+# _cmp_key() on both sides (lower case, accents folded, punctuation / apostrophes / spaces removed, doubled vowels
+# collapsed; for Indian-language names also every transliteration spelling in both directions).
+_POOL_LANGS = ("hi", "ta", "te", "ml", "kn", "bn", "mr", "pa")
+_POOL_CACHE: "OrderedDict" = OrderedDict()       # (media, year, lang, page) -> (rows, total_pages): /discover pages
+_EXT_STATE: dict = {}                            # service -> {"lock", "last", "down"}: throttle state shared by every file
+_EXT_INTERVAL = {"imdb": 0.4, "omdb": 0.3}       # seconds between two requests to one service
+_EXT_TIMEOUT_SECONDS = 8
+_EXT_DOWN_SECONDS = 60                           # after a failed request the service is skipped this long
+
+
+def _cmp_key(text: str) -> str:
+    """Comparison key of a title ("Madharaasi" == "Madharasi", "Radhe krishna" == "Radhekrishna", "Aren't" == "Arent")."""
+    return re.sub(r"([aeiou])\1+", r"\1", _norm_cmp(text or "").replace(" ", ""))
+
+
+def _ext_keys(text: str) -> set:
+    """_cmp_key() of a title and of all its transliteration spellings, shortened and lengthened."""
+    return {k for k in (_cmp_key(v) for v in [text, *_translit_variants(text), *_translit_expand(text)]) if k}
+
+
+def _key_score(a: str, b: str, translit: bool = False) -> float:
+    """1.0 when the two titles share a key; 0 when their numbers differ ("Spider-Man 2" is not "Spider-Man") or the key
+    is too short for a fuzzy match; else the fuzzy similarity of the keys (rapidfuzz, difflib without it)."""
+    ka, kb = _cmp_key(a), _cmp_key(b)
+    if not ka or not kb:
+        return 0.0
+    if ka == kb or (translit and _ext_keys(a) & _ext_keys(b)):
+        return 1.0
+    if _DIGITS.findall(ka) != _DIGITS.findall(kb) or min(len(ka), len(kb)) < 5:
+        return 0.0
+    return _rf_fuzz.ratio(ka, kb) / 100.0 if _rf_fuzz is not None else SequenceMatcher(None, ka, kb).ratio()
+
+
+def _row_names(row: dict, media: str) -> list:
+    keys = ("title", "original_title") if media == "movie" else ("name", "original_name")
+    return [row[k] for k in keys if isinstance(row.get(k), str) and row[k]]
+
+
+def _row_year(row: dict, media: str):
+    return _year_of(row.get("release_date") if media == "movie" else row.get("first_air_date"))
+
+
+def _row_indian(row: dict) -> bool:
+    return row.get("original_language") in _INDIAN_LANGS or "IN" in (row.get("origin_country") or ())
+
+
+def _ext_rank(row: dict, media: str, titles, year, indian_name: bool, translit: bool, pool: bool = False, extra_names=()):
+    """Rank tuple (title score, same year, votes) when a TMDB result passes the deep rules, else None. The year agrees
+    (+-1) AND the title key matches: exactly (spacing / spelling variants) with the name OR TMDB saying Indian, or - in
+    the year pool - with the same year alone; closely (>= MOVIE_FUZZY_MIN) only when BOTH say Indian. Few votes never
+    matter here: a new regional film has none."""
+    ry = _row_year(row, media)
+    if not year or not ry or abs(ry - year) > 1:
+        return None
+    names = _row_names(row, media) + [n for n in extra_names if isinstance(n, str) and n]
+    score = max((_key_score(t, n, translit) for t in titles for n in names), default=0.0)
+    if score >= 1.0:
+        ok = indian_name or _row_indian(row) or (pool and ry == year)
+    else:
+        ok = score >= MOVIE_FUZZY_MIN and indian_name and _row_indian(row)
+    return (score, 1 if ry == year else 0, row.get("vote_count") or 0) if ok else None
+
+
+async def _tmdb_json(session, tmdb_key: str, path: str, params: dict):
+    """Parsed JSON of one TMDB GET (discover / find) or _TMDB_ERROR: the retry rules of _tmdb_search()."""
+    if not tmdb_key:
+        return _TMDB_ERROR
+    query = dict(params, api_key=tmdb_key)
+    for attempt in range(TMDB_RETRIES):
+        try:
+            async with session.get(f"{TMDB_BASE}{path}", params=query,
+                                   timeout=aiohttp.ClientTimeout(total=TMDB_TIMEOUT_SECONDS)) as resp:
+                if resp.status == 429:
+                    try:
+                        wait = int(resp.headers.get("Retry-After", 2))
+                    except (TypeError, ValueError):
+                        wait = 2
+                    await asyncio.sleep(min(max(wait, 1), 15))
+                    continue
+                if resp.status >= 500:
+                    await asyncio.sleep(1 + attempt)
+                    continue
+                if resp.status != 200:
+                    return _TMDB_ERROR
+                data = await resp.json()
+                return data if isinstance(data, dict) else _TMDB_ERROR
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug("TMDB %s failed: %s", path, e)
+            await asyncio.sleep(1 + attempt)
+    return _TMDB_ERROR
+
+
+def _pool_langs(p: dict) -> list:
+    """Pool languages, the file's own first (the language words of the name), then the rest."""
+    own = []
+    for w in [*((p.get("movie") or {}).get("languages") or []), p.get("language")]:
+        c = _lang_code_of(w)
+        if c in _POOL_LANGS and c not in own:
+            own.append(c)
+    return own + [c for c in _POOL_LANGS if c not in own]
+
+
+async def _pool_page(session, tmdb_key: str, media: str, year: int, lang: str, page: int):
+    """(rows, total_pages) of one /discover page of the year + language pool, or _TMDB_ERROR. Cached."""
+    ck = (media, year, lang, page)
+    hit = _POOL_CACHE.get(ck)
+    if hit is not None:
+        _POOL_CACHE.move_to_end(ck)
+        return hit
+    params = {"sort_by": "popularity.desc", "include_adult": "false", "with_original_language": lang, "page": page}
+    if media == "movie":
+        params["primary_release_year"] = year
+    else:
+        params["first_air_date_year"] = year
+        params["with_origin_country"] = "IN"
+    data = await _tmdb_json(session, tmdb_key, f"/discover/{media}", params)
+    if data is _TMDB_ERROR:
+        return _TMDB_ERROR
+    try:
+        val = ([r for r in (data.get("results") or []) if isinstance(r, dict)], max(1, int(data.get("total_pages") or 1)))
+    except (TypeError, ValueError):
+        return _TMDB_ERROR
+    _POOL_CACHE[ck] = val
+    if len(_POOL_CACHE) > _CACHE_MAX:
+        _POOL_CACHE.popitem(last=False)
+    return val
+
+
+async def _tmdb_pool_pick(session, tmdb_key: str, p: dict, media: str, titles, year, indian_name: bool, translit: bool):
+    """-> (best TMDB row | None, errored): the file's title looked up in the year + language pool (see the block comment
+    above), page by page, the file's own language first, stopping at the first confident hit. A near miss (title
+    similarity >= 0.6) is checked against its cached alternative titles (at most 3 per search)."""
+    if MOVIE_POOL_PAGES <= 0 or not year:
         return None, False
-    mine = _translit_keys(mv["title"])
-    best, best_key, errored = None, None, False
-    for variant in mv["variants"][:MOVIE_VARIANT_SEARCHES]:
-        results = await _tmdb_search(session, "movie", variant, tmdb_key)
+    errored, alt_budget = False, 3
+    for lang in _pool_langs(p):
+        best, best_rank = None, None
+        for page in range(1, MOVIE_POOL_PAGES + 1):
+            got = await _pool_page(session, tmdb_key, media, year, lang, page)
+            if got is _TMDB_ERROR:
+                errored = True
+                break
+            rows, total = got
+            for r in rows:
+                rank = _ext_rank(r, media, titles, year, indian_name, translit, pool=True)
+                if rank is None and alt_budget > 0 and r.get("id") and _row_year(r, media) == year:
+                    near = max((_key_score(t, n, translit) for t in titles for n in _row_names(r, media)), default=0.0)
+                    if near >= 0.6:
+                        alt_budget -= 1
+                        alts = await _tmdb_alt_titles(session, media, r["id"], tmdb_key)
+                        if alts is not _TMDB_ERROR:
+                            rank = _ext_rank(r, media, titles, year, indian_name, translit, pool=True, extra_names=alts)
+                if rank is not None and (best is None or rank > best_rank):
+                    best, best_rank = r, rank
+            if best is not None or page >= total:
+                break
+        if best is not None:
+            return best, errored
+    return None, errored
+
+
+async def _ext_get(session, service: str, url: str, params=None, headers=None):
+    """Parsed JSON, None (HTTP 404) or _TMDB_ERROR for IMDb / OMDb. Never raises. One request at a time, spaced apart,
+    8 s timeout, one retry on 429 / 5xx; after a failure the service is skipped for _EXT_DOWN_SECONDS."""
+    if aiohttp is None:
+        return _TMDB_ERROR
+    st = _EXT_STATE.setdefault(service, {"lock": None, "last": 0.0, "down": 0.0})
+    if st["lock"] is None:
+        st["lock"] = asyncio.Lock()
+    loop = asyncio.get_event_loop()
+    if loop.time() < st["down"]:
+        return _TMDB_ERROR
+    for attempt in range(2):
+        async with st["lock"]:
+            wait = _EXT_INTERVAL.get(service, 0.5) - (loop.time() - st["last"])
+            if wait > 0:
+                await asyncio.sleep(wait)
+            try:
+                async with session.get(url, params=params, headers=headers,
+                                       timeout=aiohttp.ClientTimeout(total=_EXT_TIMEOUT_SECONDS)) as resp:
+                    st["last"] = loop.time()
+                    if resp.status == 404:
+                        return None
+                    if resp.status == 429 or resp.status >= 500:
+                        await asyncio.sleep(1 + attempt)
+                        continue
+                    if resp.status != 200:
+                        break
+                    return await resp.json(content_type=None)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug("%s request failed: %s", service, e)
+                await asyncio.sleep(1 + attempt)
+    st["down"] = loop.time() + _EXT_DOWN_SECONDS
+    return _TMDB_ERROR
+
+
+async def _imdb_suggest(session, query: str):
+    """IMDb suggestion rows ([] = nothing) or _TMDB_ERROR. Cached per query. (IMDb's public autocomplete endpoint;
+    off with USE_IMDB_SUGGEST=0.) The parser is defensive: any other shape counts as "no rows"."""
+    q = re.sub(r"\s+", " ", (query or "").strip().lower())
+    first = q[:1] if q[:1].isascii() and q[:1].isalnum() else ""
+    if not USE_IMDB_SUGGEST or not first:
+        return []
+    rows = _qc_get("imdb", q)
+    if rows is not None:
+        return rows
+    data = await _ext_get(session, "imdb", f"https://v3.sg.media-imdb.com/suggestion/{first}/{quote(q)}.json")
+    if data is _TMDB_ERROR:
+        return _TMDB_ERROR
+    d = data.get("d") if isinstance(data, dict) else None
+    rows = [r for r in (d if isinstance(d, list) else []) if isinstance(r, dict) and str(r.get("id") or "").startswith("tt")]
+    _qc_put("imdb", q, rows)
+    return rows
+
+
+def _imdb_kind(row: dict):
+    """"movie" | "tv" | None for one suggestion row: features and TV films are movies; TV series / mini-series are shows."""
+    qid, label = str(row.get("qid") or ""), str(row.get("q") or "").lower()
+    if qid in ("movie", "tvMovie") or label in ("feature", "tv movie"):
+        return "movie"
+    if qid in ("tvSeries", "tvMiniSeries") or label in ("tv series", "tv mini-series", "tv mini series"):
+        return "tv"
+    return None
+
+
+async def _omdb_rows(session, title: str, kind: str):
+    """OMDb search rows in the IMDb row shape ({"id", "l", "y", "qid"}); [] without OMDB_API_KEY; _TMDB_ERROR on failure."""
+    if not OMDB_API_KEY:
+        return []
+    key = f"{title} {kind}"
+    rows = _qc_get("omdb", key)
+    if rows is not None:
+        return rows
+    data = await _ext_get(session, "omdb", "https://www.omdbapi.com/",
+                          params={"apikey": OMDB_API_KEY, "s": title, "type": "movie" if kind == "movie" else "series"})
+    if data is _TMDB_ERROR:
+        return _TMDB_ERROR
+    rows = []
+    for r in ((data or {}).get("Search") or []) if isinstance(data, dict) else []:
+        try:
+            rows.append({"id": str(r["imdbID"]), "l": str(r["Title"]), "y": int(str(r["Year"])[:4]),
+                         "qid": "movie" if kind == "movie" else "tvSeries"})
+        except (KeyError, TypeError, ValueError):
+            continue
+    _qc_put("omdb", key, rows)
+    return rows
+
+
+async def _tmdb_by_imdb(session, tmdb_key: str, imdb_id: str, kind: str):
+    """The TMDB row of an IMDb id (GET /find): a dict, None (TMDB does not list it) or _TMDB_ERROR. Cached."""
+    hit = _qc_get("find", imdb_id)
+    if hit is None:
+        data = await _tmdb_json(session, tmdb_key, f"/find/{imdb_id}", {"external_source": "imdb_id"})
+        if data is _TMDB_ERROR:
+            return _TMDB_ERROR
+        rows = data.get("movie_results" if kind == "movie" else "tv_results") or []
+        hit = rows[0] if rows and isinstance(rows[0], dict) else {}
+        _qc_put("find", imdb_id, hit)
+    return hit or None
+
+
+async def _imdb_lookup(session, tmdb_key: str, titles, year, kind: str, translit: bool):
+    """-> (entry | None, errored). entry = {"source": "imdb" | "omdb", "imdb_id", "title", "year", "tmdb": TMDB row | None}.
+    IMDb's suggestions (then OMDb, only with OMDB_API_KEY) must list the SAME title (exact key) for the file's year (+-1)
+    and type; the tt id is resolved with TMDB /find, so the film / show gets its TMDB id when TMDB has it."""
+    if not year:
+        return None, False
+    errored = False
+    for service, fetch in (("imdb", _imdb_suggest), ("omdb", None)):
+        for t in titles[:2]:
+            rows = await (fetch(session, t) if fetch else _omdb_rows(session, t, kind))
+            if rows is _TMDB_ERROR:
+                errored = True
+                continue
+            best = None
+            for r in rows:
+                y = r.get("y")
+                if _imdb_kind(r) != kind or not isinstance(y, int) or abs(y - year) > 1:
+                    continue
+                if max((_key_score(q, str(r.get("l") or ""), translit) for q in titles), default=0.0) < 1.0:
+                    continue                                   # the other source must name the SAME title
+                if best is None or (y == year and best.get("y") != year):
+                    best = r
+            if best is not None:
+                row = await _tmdb_by_imdb(session, tmdb_key, best["id"], kind)
+                return {"source": service, "imdb_id": best["id"], "title": best.get("l"), "year": best.get("y"),
+                        "tmdb": None if row is _TMDB_ERROR else row}, errored
+    return None, errored
+
+
+async def _tmdb_movie_variants(session, tmdb_key: str, p: dict):
+    """-> (result | None, errored): the TMDB movie found by the query variants of the file's title (_title_variants():
+    joined / split / transliterated / without a leading number / first words), each searched WITH the year, then one
+    /search/multi - at most MOVIE_MAX_SEARCHES requests per distinct title, stopping at the first confident hit. A result
+    counts by _ext_rank(): the year (+-1) AND the title key agree, with the Indian-language conditions described there."""
+    mv, year = p["movie"], p.get("year")
+    if not year or MOVIE_MAX_SEARCHES <= 0:
+        return None, False
+    translit = bool(mv["indian"] or _TRANSLIT_HINT_RE.search(mv["title"]))
+    mine = list(dict.fromkeys([mv["title"], *mv["titles"]]))
+    plan = [("movie", v) for v in mv["variants"][:max(0, MOVIE_MAX_SEARCHES - 1)]] + [("multi", mv["title"])]
+    best, best_rank, errored = None, None, False
+    for media, query in plan[:MOVIE_MAX_SEARCHES]:
+        results = await _tmdb_search(session, media, query, tmdb_key, year if media == "movie" else None)
         if results is _TMDB_ERROR:
             errored = True
             continue
         for r in (results or [])[:10]:
-            ry = _year_of(r.get("release_date"))
-            if not ry or abs(ry - year) > 1:
-                continue
-            if not (mv["indian"] or r.get("original_language") in _INDIAN_LANGS):
-                continue
-            names = [n for n in (r.get("title"), r.get("original_title")) if n]
-            if not any(mine & _translit_keys(n) for n in names):
-                continue
-            key = (1 if ry == year else 0, r.get("vote_count") or 0)
-            if best is None or key > best_key:
-                best, best_key = r, key
+            if media == "multi" and r.get("media_type") != "movie":
+                continue                                       # people and shows are not this file
+            rank = _ext_rank(r, "movie", mine, year, mv["indian"], translit)
+            if rank is not None and (best is None or rank > best_rank):
+                best, best_rank = r, rank
         if best is not None:
             break
     return best, errored
@@ -3866,37 +4433,155 @@ async def _wikidata_film_for(session, p: dict):
 
 
 async def _movie_fallbacks(session, tmdb_key: str, p: dict, info: dict, anime_mode: bool):
-    """-> ("found", kind) | ("none", None) | ("error", None) for a movie-like name TMDB did not know.
-    Never raises: a failing layer just means "no evidence"."""
+    """-> ("found", kind) | ("none", None) | ("error", None) for a movie-like name TMDB's own title search did not know.
+    Order: TMDB query variants -> TMDB year + language pool -> IMDb (OMDb) -> Wikidata (see the block comment above).
+    TMDB failing while nothing else vouches is "error" (no guessing during an outage); IMDb / OMDb / Wikidata failing is
+    only "no evidence". The verdict is cached per film. Never raises."""
     try:
-        mv = p["movie"]
-        if mv["variants"] and p.get("year"):
-            match, errored = await _tmdb_movie_variants(session, tmdb_key, p)
+        mv, year = p["movie"], p.get("year")
+        cached = _show_get(p, "movie_fb")
+        if cached is not None:                                # another part of the same film: replay the verdict
+            if cached["status"] != "found":
+                return "none", None
+            if cached.get("tmdb_id"):
+                info["tmdb_id"], info["tmdb_media"] = cached["tmdb_id"], "movie"
+            _movie_note(info, **cached["note"])
+            return "found", cached["kind"]
+        translit = bool(mv["indian"] or _TRANSLIT_HINT_RE.search(mv["title"]))
+        mine = list(dict.fromkeys([mv["title"], *mv["titles"]]))
+        tmdb_err = ext_err = False
+
+        def _store(kind: str, tmdb_id, note: dict):
+            if tmdb_id:
+                info["tmdb_id"], info["tmdb_media"] = tmdb_id, "movie"
+            _movie_note(info, **note)
+            _show_put(p, "movie_fb", {"status": "found", "kind": kind, "tmdb_id": tmdb_id, "note": note})
+            return "found", kind
+
+        async def _tmdb_found(match: dict, source: str):
+            mid = match.get("id")
+            animated = TMDB_ANIMATION_GENRE_ID in (match.get("genre_ids") or [])
+            kind = "movie"
+            if _is_anime_result(match, "movie"):
+                kind = "anime"
+            elif anime_mode:
+                ok, _src, _why, _lst = await _tmdb_anime_confirm(session, match, "movie", mid, animated)
+                kind = "anime" if ok else "movie"
+            return _store(kind, mid, {"source": source, "matched": match.get("title"), "tmdb_id": mid})
+
+        if year:
+            match, err = await _tmdb_movie_variants(session, tmdb_key, p)
+            tmdb_err = tmdb_err or err
             if match:
-                mid = match.get("id")
-                animated = TMDB_ANIMATION_GENRE_ID in (match.get("genre_ids") or [])
-                kind = "movie"
-                if _is_anime_result(match, "movie"):
-                    kind = "anime"
-                elif anime_mode:
-                    ok, _src, _why, _lst = await _tmdb_anime_confirm(session, match, "movie", mid, animated)
-                    kind = "anime" if ok else "movie"
-                info["tmdb_id"], info["tmdb_media"] = mid, "movie"
-                _movie_note(info, source="tmdb-variant", matched=match.get("title"), tmdb_id=mid)
-                return "found", kind
-            if errored:
-                return "error", None                          # don't guess during an outage
-        if USE_WIKIDATA and USE_WIKIDATA_FILMS and p.get("year"):
-            qid = await _wikidata_film_for(session, p)
-            if qid:
-                _movie_note(info, source="wikidata", wikidata_id=qid)
-                return "found", "movie"
+                return await _tmdb_found(match, "tmdb-variant")
+            if translit:                                      # the year + language pool is for Indian-language names
+                match, err = await _tmdb_pool_pick(session, tmdb_key, p, "movie", mine, year, mv["indian"], translit)
+                tmdb_err = tmdb_err or err
+                if match:
+                    return await _tmdb_found(match, "tmdb-pool")
+            ent, err = await _imdb_lookup(session, tmdb_key, mine + mv["variants"][:1], year, "movie", translit)
+            ext_err = ext_err or err
+            if ent:
+                if ent["tmdb"]:
+                    return await _tmdb_found(ent["tmdb"], ent["source"])
+                return _store("movie", None, {"source": ent["source"], "imdb_id": ent["imdb_id"], "matched": ent["title"]})
+            if USE_WIKIDATA and USE_WIKIDATA_FILMS:
+                qid = await _wikidata_film_for(session, p)
+                if qid:
+                    return _store("movie", None, {"source": "wikidata", "wikidata_id": qid})
+                ext_err = ext_err or _show_get(p, "wikidata_film") is None      # no cached verdict = Wikidata failed
+        if tmdb_err:
+            return "error", None                              # don't guess during an outage
+        if not ext_err:
+            _show_put(p, "movie_fb", {"status": "none"})      # a clean "nobody knows it"; a failure is never cached
         return "none", None
     except asyncio.CancelledError:
         raise
     except Exception as e:
         logger.debug("deep movie fallbacks failed for %r: %s", p.get("clean_title"), e)
         return "none", None
+
+
+async def _tv_fallbacks(session, tmdb_key: str, p: dict, info: dict) -> dict:
+    """The deep show search found nothing for a show-like name WITH a year: TMDB query variants searched with the year
+    (+ one /search/multi), then the year + language pool of Indian shows (/discover/tv, first_air_date_year, origin IN).
+    -> {"status": "found" | "none" | "error", "kind": "series" | None, "entry": None, "why": str}; a found show sets
+    info["tmdb_id"] / info["tmdb_media"]. Anime is never decided here (the anime authorities do that). Never raises."""
+    none = {"status": "none", "kind": None, "entry": None}
+    try:
+        year = p.get("year")
+        if not year or MOVIE_MAX_SEARCHES <= 0:
+            return none
+        cached = _show_get(p, "tv_fb")
+        if cached is not None:
+            if not cached.get("tmdb_id"):
+                return none
+            info["tmdb_id"], info["tmdb_media"] = cached["tmdb_id"], "tv"
+            return {"status": "found", "kind": "series", "entry": None, "why": cached["why"]}
+        titles = [c["title"] for c in _cands_of(p) if not c.get("dropped")][:SERIES_MAX_SEARCHES] or list(p["titles"])[:1]
+        indian = p.get("language") in _INDIAN_LANGS
+        translit = bool(indian or _TRANSLIT_HINT_RE.search(titles[0]))
+        plan = [("tv", v) for v in _title_variants(titles[0], translit)[:max(0, MOVIE_MAX_SEARCHES - 1)]]
+        plan.append(("multi", titles[0]))
+        best, best_rank, source, errored = None, None, "", False
+        for media, query in plan[:MOVIE_MAX_SEARCHES]:
+            results = await _tmdb_search(session, media, query, tmdb_key, year if media == "tv" else None)
+            if results is _TMDB_ERROR:
+                errored = True
+                continue
+            for r in (results or [])[:10]:
+                if (media == "multi" and r.get("media_type") != "tv") or _is_anime_result(r, "tv"):
+                    continue
+                rank = _ext_rank(r, "tv", titles, year, indian, translit)
+                if rank is not None and (best is None or rank > best_rank):
+                    best, best_rank, source = r, rank, "tmdb-variant"
+            if best is not None:
+                break
+        if best is None and translit:
+            best, err = await _tmdb_pool_pick(session, tmdb_key, p, "tv", titles, year, indian, translit)
+            errored, source = errored or err, "tmdb-pool"
+        if best is None:
+            if errored:
+                return {"status": "error", "kind": None, "entry": None}
+            _show_put(p, "tv_fb", {"tmdb_id": None})
+            return none
+        why = f"{source} match {best.get('name')!r}"
+        info["tmdb_id"], info["tmdb_media"] = best.get("id"), "tv"
+        _show_put(p, "tv_fb", {"tmdb_id": best.get("id"), "why": why})
+        return {"status": "found", "kind": "series", "entry": None, "why": why}
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.debug("deep show fallbacks failed for %r: %s", p.get("clean_title"), e)
+        return none
+
+
+async def _imdb_show_facts(session, tmdb_key: str, p: dict):
+    """Show facts (the _empty_facts shape, source "imdb" / "omdb") when IMDb / OMDb list a TV series with the SAME title
+    and a start year within +-1 of the file's year; None otherwise (no year, nothing found, a failure). Cached per show."""
+    try:
+        year = p.get("year")
+        if not year:
+            return None
+        entry = _show_get(p, "imdb")
+        if entry is None:
+            titles = [c["title"] for c in _cands_of(p) if not c.get("dropped")][:2] or list(p["titles"])[:1]
+            translit = bool(p.get("language") in _INDIAN_LANGS or _TRANSLIT_HINT_RE.search(titles[0]))
+            ent, err = await _imdb_lookup(session, tmdb_key, titles, year, "tv", translit)
+            if ent:
+                facts = _empty_facts(ent["source"], ent["imdb_id"])
+                facts["names"], facts["first_year"] = [ent["title"]], ent["year"]
+                entry = {"verdict": "found", "facts": facts}
+            elif not err:
+                entry = {"verdict": "none", "facts": None}
+            if entry is not None:
+                _show_put(p, "imdb", entry)
+        return entry["facts"] if entry and entry["verdict"] == "found" else None
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.debug("IMDb show lookup failed for %r: %s", p.get("clean_title"), e)
+        return None
 
 
 # ---- the confidence score ---------------------------------------------------------
@@ -3948,23 +4633,44 @@ def _numbers_ok(p: dict, f: dict) -> bool:
     return False
 
 
-def _edu_hit(names, show_names=()) -> bool:
-    """Course / lecture naming: _EDU_RE on any raw name ("Python Tutorial Episode 5"),
-    or a numbered lecture file name ("5.1.3 Intro to Python"). An edu word that is part
-    of the matched SHOW's own title ("Class", "The Chapter") does not count."""
-    shows = [s.strip() for s in show_names if s and s.strip()]
+# STRONG course signals: a course / lecture / tutorial / bootcamp word, a course platform, or "class 5" / "lesson 12" /
+# "module 3" / "chapter 2" with a number. _EDU_RE alone (a single word such as "Lessons" or "Classroom") is only SOFT.
+_EDU_COURSE_RE = re.compile(
+    r"(?<![A-Za-z])(?:lectures?|lec|tutorials?|courses?|bootcamp|masterclass|seminar|webinar|syllabus|udemy|coursera|"
+    r"edx|skillshare|pluralsight|simplilearn|nptel|udacity|linkedin[\s._-]?learning|"
+    r"(?:class|classes|lesson|lessons|module|modules|chapter|chapters)[\s._-]*(?:no\.?[\s._-]*)?\d{1,3})(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+
+def _edu_level(names, show_names=()) -> int:
+    """0 = no course naming, 1 = SOFT (only generic words: "Lessons", "Classroom", "Chapter"), 2 = STRONG (a numbered
+    lecture "5.1.3 Intro to Python", a course / lecture / tutorial / bootcamp / platform word, "class 5").
+    Words that belong to the matched SHOW's own title ("Some Lessons Aren't Taught In Classrooms") never count; the
+    comparison ignores case, accents and punctuation. A year in brackets - "(2025)" - marks a release name, not a
+    course, so it switches every word signal off (a numbered lecture name stays strong)."""
+    shows = [_norm_cmp(s) for s in show_names if s and s.strip()]
+    level = 0
     for i, raw in enumerate(names):
         text = raw or ""
         if i == 0 and _EDU_NUMBERED_RE.match(text):
-            return True
-        if not _EDU_RE.search(text):
+            return 2
+        if _MOVIE_BRACKET_YEAR_RE.search(text):
             continue
-        rest = text.replace(".", " ").replace("_", " ")
+        rest = _norm_cmp(text.replace(".", " ").replace("_", " "))
         for s in shows:
-            rest = re.sub(re.escape(s), " ", rest, flags=re.IGNORECASE)
+            if s:
+                rest = rest.replace(s, " ")
+        if _EDU_COURSE_RE.search(rest):
+            return 2
         if _EDU_RE.search(rest):
-            return True
-    return False
+            level = 1
+    return level
+
+
+def _edu_hit(names, show_names=()) -> bool:
+    """Any course naming at all (soft or strong): see _edu_level()."""
+    return _edu_level(names, show_names) > 0
 
 
 def _extra_hit(parsed, names) -> bool:
@@ -4010,7 +4716,8 @@ def _score_series(p: dict, tmdb=None, tvmaze=None, openai: bool = False, exact: 
       5. a generic title (Episode / Video / Part / Movie / one letter or number) never counts
       4. an edu / NSFW / sample-promo-recap hit is never a series
       3. no explicit episode marker (or air date) needs TMDB AND TVmaze to agree: a
-         plain title match, or a single source, is not enough
+         plain title match, or a single source, is not enough (a TV-source tag - PDTV / HDTV /
+         DSR / TVRip / DVBS - is a positive series signal, so one source is enough then)
       1/2. marker + one source, or a marker alone (SERIES_EPISODE_FALLBACK), pass
     An AMBIGUOUS franchise match (language unknown, several versions) still confirms the
     franchise but is not used for the year / season / language / episode-title signals."""
@@ -4025,6 +4732,10 @@ def _score_series(p: dict, tmdb=None, tvmaze=None, openai: bool = False, exact: 
     elif p.get("is_episode") or p.get("series_like"):
         score += _W_WEAK_EPISODE
         sig.append("guess-ep")
+    tv_source = bool(p.get("tv_source"))
+    if tv_source:
+        score += _W_TV_SOURCE
+        sig.append("tv-source")
     if tmdb:
         score += _W_TMDB
         sig.append("tmdb")
@@ -4039,7 +4750,7 @@ def _score_series(p: dict, tmdb=None, tvmaze=None, openai: bool = False, exact: 
             sig.append("agree")
     if wikidata:
         score += _W_WIKIDATA
-        sig.append("wikidata")
+        sig.append(wikidata.get("source") or "wikidata")      # "imdb" facts travel in this slot too
     if openai:
         score += _W_OPENAI
         sig.append("openai")
@@ -4084,7 +4795,7 @@ def _score_series(p: dict, tmdb=None, tvmaze=None, openai: bool = False, exact: 
     if _generic_title(title):
         sig.append("-generic")
         return False, score, sig, "generic title"
-    if not marker and not (tmdb and tvmaze):
+    if not marker and not (tmdb and tvmaze) and not (tv_source and (tmdb or tvmaze or wikidata)):
         return False, score, sig, "no episode marker and no second source agreeing"
     if marker and not (tmdb or tvmaze or wikidata or openai) and not SERIES_EPISODE_FALLBACK:
         return False, score, sig, "episode-marker fallback is switched off"
@@ -4104,6 +4815,10 @@ def _series_other_reason(p: dict, reason: str, vouched: bool):
         shown = ", ".join(repr(t) for t in (p["movie"].get("titles") or [title])[:3])
         year = f" ({p['year']})" if p.get("year") else ""
         return "not_found", f"no TMDB / Wikidata film match for {shown}{year}"
+    if low.startswith("course") and vouched:
+        return "education_vetoed", f"course words in the name, but a source knows {title!r}: {reason}"
+    if p.get("season_pack") and not vouched:
+        return "season_pack", f"season pack of {title!r}: {reason}"
     if low.startswith(("course", "adult", "generic")):
         return "unidentified", reason
     if not vouched:
@@ -4130,8 +4845,10 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
     sinfo = {"candidate": False, "source": "-", "id": None, "score": 0, "signals": [],
              "reason": "", "runtime": None, "title": first.get("clean_title") or first["titles"][0],
              "language": first.get("language"), "ambiguous": False, "to_anime": None,
+             "season_pack": any(pp.get("season_pack") for pp in parsed),       # "S01 Combined": the length gate skips it
+             "tv_source": any(pp.get("tv_source") for pp in parsed),
              "looked_series": any(pp.get("strong_episode") or pp.get("is_episode") or pp.get("series_like")
-                                  for pp in parsed)}
+                                  or pp.get("tv_source") for pp in parsed)}
     info["series"] = sinfo
     minutes = movie_duration_minutes(message)
     nsfw = is_nsfw(message)
@@ -4141,16 +4858,21 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
         shows = [n for f in (tmdb, tvmaze, wikidata) if f for n in f["names"]]
         ambiguous = bool(entry and entry.get("ambiguous"))
         movie_like = False
-        if tmdb and not p.get("strong_episode") and p.get("year") and p.get("release_group"):
+        if tmdb and not p.get("strong_episode") and not p.get("tv_source") and p.get("year") and p.get("release_group"):
             movie_like = await _tmdb_movie_title_exists(session, tmdb_key, p)
         lang = p.get("language")
         lang_ok = bool(lang and not ambiguous and (
             any(_lang_code_of(f.get("lang")) == lang for f in (tmdb, tvmaze) if f)
             or bool(entry and entry.get("lang_ok"))))
         ep_title = bool(tmdb and not ambiguous and await _episode_title_ok(session, tmdb_key, p, tmdb))
+        # Education is only a CANDIDATE: a source that knows the show wins over soft course words ("Lessons", "Classroom"),
+        # over words of the show's own title and over a bracketed year. Strong course words still veto a known show.
+        confirmed = bool(tmdb or tvmaze or wikidata or openai)
+        edu_level = _edu_level(names, shows)
+        edu = edu_level == 2 or (edu_level == 1 and not confirmed)
         ok, score, signals, reason = _score_series(
             p, tmdb, tvmaze, openai, _facts_exact(p, tmdb), minutes,
-            _edu_hit(names, shows), nsfw, extra, movie_like, wikidata, lang_ok, ep_title, ambiguous)
+            edu, nsfw, extra, movie_like, wikidata, lang_ok, ep_title, ambiguous)
         if ok and tvmaze and any(str(g).lower() == "anime" for g in tvmaze["genres"]):
             ok, reason = False, "TVmaze lists it as anime"
         sinfo.update(
@@ -4159,8 +4881,10 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
             source=source, id=ident, score=score, signals=signals, reason=reason, ambiguous=ambiguous,
             title=p.get("clean_title") or p["titles"][0], language=p.get("language"),
             runtime=next((f["runtime"] for f in (tmdb, tvmaze) if f and f.get("runtime")), None))
+        if not ok and edu and not (nsfw or extra) and not confirmed:
+            return _finish("education")                # course signals and no source knows it: education, not Other
         if not ok:
-            _other_note(info, *_series_other_reason(p, reason, bool(tmdb or tvmaze or wikidata or openai)))
+            _other_note(info, *_series_other_reason(p, reason, confirmed))
         return _finish("series") if ok else "other"
 
     # what the movie cleaner made of the name (handlers/autosort.py logs it when the file ends in Other)
@@ -4195,6 +4919,11 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
         if p.get("is_episode") or p.get("series_like"):
             hit = await _deep_tmdb_tv(session, tmdb_key, p, use_anilist, anilist_key, info, anime_mode)
             status, kind = hit["status"], hit["kind"]
+            if status == "none" and p.get("year"):
+                # TMDB answered "no such show": query variants with the year, then the year + language pool
+                alt = await _tv_fallbacks(session, tmdb_key, p, info)
+                if alt["status"] != "none":
+                    hit, status, kind = alt, alt["status"], alt["kind"]
         else:
             status, kind = await _tmdb_identify(session, tmdb_key, p, use_anilist, anilist_key, info, anime_mode)
             if status == "none" and p.get("movie"):
@@ -4229,8 +4958,8 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
             tvmaze, _state = await _tvmaze_facts_for(session, p)
         return await _decide(p, "tmdb", tmdb_id, tmdb, tvmaze, entry=entry)
 
-    # 2) TVmaze, then Wikidata: only for names with an explicit marker / air date
-    marked = [pp for pp in parsed if pp.get("strong_episode")]
+    # 2) TVmaze, then Wikidata, then IMDb (OMDb): only for names with an explicit marker / air date / TV-source tag
+    marked = [pp for pp in parsed if pp.get("strong_episode") or pp.get("tv_source")]
     tvmaze, wikidata, ext_p = None, None, None
     if USE_TVMAZE:
         for pp in marked:
@@ -4244,6 +4973,12 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
             if facts:
                 wikidata, ext_p = facts, pp
                 break
+    if tvmaze is None and wikidata is None and (USE_IMDB_SUGGEST or OMDB_API_KEY):
+        for pp in marked:                                  # IMDb needs the year: it must agree (+-1) with the show's start
+            facts = await _imdb_show_facts(session, tmdb_key, pp)
+            if facts:
+                wikidata, ext_p = facts, pp                # travels in the Wikidata slot, source "imdb" / "omdb"
+                break
     if errored and tvmaze is None and wikidata is None:
         # TMDB failed and nothing else vouches for the file: don't guess during an outage
         sinfo["reason"] = "TMDB unavailable"
@@ -4251,7 +4986,7 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
     if tvmaze is not None:
         return await _decide(ext_p, "tvmaze", tvmaze.get("id"), None, tvmaze)
     if wikidata is not None:
-        return await _decide(ext_p, "wikidata", wikidata.get("id"), None, None, wikidata=wikidata)
+        return await _decide(ext_p, wikidata.get("source") or "wikidata", wikidata.get("id"), None, None, wikidata=wikidata)
 
     # 3) OpenAI (only when a key was passed), 4) the scored marker fallback
     verdict = await _other_or_openai(message, names, is_files, session, openai_key)
@@ -4608,7 +5343,7 @@ def _anime_attach(p: dict, raw_name: str, check_extra: bool) -> None:
     signals = []
     if p.get("anime_tag"):
         signals.append("tag")
-    serial_style = bool(p.get("platforms") or p.get("date_episode"))
+    serial_style = bool(p.get("platforms") or p.get("date_episode") or p.get("serial_style"))
     own_hint = bool(a["has_episode"] and not serial_style and (
         (a["season"] is None and not p.get("season")) or len(a["titles"]) > 1))
     if a["fansub"]:
@@ -4620,8 +5355,13 @@ def _anime_attach(p: dict, raw_name: str, check_extra: bool) -> None:
     has_ep = bool(a["has_episode"] or p.get("strong_episode"))
     if a["dub"] and has_ep:
         signals.append("dub+ep")
-    strong = bool(p.get("anime_tag") or a["fansub"] or a["known_group"] or (a["dub"] and has_ep))
+    # Anime must be PROVEN, never guessed from naming: only a fansub tag / a known anime-only group is "strong" (it
+    # swaps the title candidates). "dub + episode" and "episode without season" make a SOFT candidate: AniList is
+    # asked first, but the answer only counts with an exact title + popularity (see _anime_lookup), the title
+    # candidates of the name are kept, and TMDB / TVmaze / IMDb decide when AniList does not know it.
+    strong = bool(p.get("anime_tag") or a["fansub"] or a["known_group"])
     a["signals"], a["candidate"], a["strong"] = signals, bool(signals), strong
+    a["soft"] = bool(signals) and not strong
     p["anime"] = a
 
     if check_extra and not p["extra"]:
@@ -4938,7 +5678,7 @@ async def _anime_list_lookup(session, media_type: str, tmdb_id):
 
 
 # ---- lookup (AniList first, Jikan when AniList failed), cache, first pass --------------------------------
-_ANIME_CACHE: "OrderedDict" = OrderedDict()      # (title without season markers, year | None) -> verdict dict
+_ANIME_CACHE: "OrderedDict" = OrderedDict()      # (title without season markers, year | None, strict) -> verdict dict
 
 
 def _anime_note(info, **kw) -> dict:
@@ -4958,7 +5698,7 @@ def _anime_media_fields(media: dict, source: str = "anilist") -> dict:
             "matched": t.get("romaji") or t.get("english") or t.get("native")}
 
 
-async def _anime_lookup(session, p: dict, anilist_key: str, use_anilist: bool, minutes=None) -> dict:
+async def _anime_lookup_core(session, p: dict, anilist_key: str, use_anilist: bool, minutes=None) -> dict:
     """AniList (then Jikan, only when AniList FAILED) for one parsed name, with the anime verdict cache.
     -> {"status": "found" | "none" | "error" | "off", "source": "anilist" | "jikan" | "-",
         "media": dict | None, "d": details, "cached": bool}
@@ -4972,7 +5712,10 @@ async def _anime_lookup(session, p: dict, anilist_key: str, use_anilist: bool, m
         return off
     year = p.get("year") or ap.get("year")
     base = _strip_season_words(_norm_cmp(titles[0]))[0] or _norm_cmp(titles[0])
-    ck = (base, year or None)
+    # strict (exact title + popularity) for a name with no release signal AND for a SOFT anime candidate: naming alone
+    # ("Episode 25" + "Dubbed", an episode number without a season) is never proof, an obscure same-name entry is not one
+    weak = bool(p.get("weak", False)) or bool(ap.get("soft"))
+    ck = (base, year or None, weak)       # a strict "none" must not answer a fansub-tagged name (and the other way round)
     hit = _ANIME_CACHE.get(ck)
     if hit is not None:
         _ANIME_CACHE.move_to_end(ck)
@@ -4982,7 +5725,6 @@ async def _anime_lookup(session, p: dict, anilist_key: str, use_anilist: bool, m
     ctx = {"episode": bool(ap.get("has_episode") or p.get("strong_episode") or p.get("is_episode")),
            "season": ap.get("season") or p.get("season"), "minutes": minutes}
     queries = [_norm_cmp(t) for t in titles]
-    weak = bool(p.get("weak", False))
 
     errored = False
     for title in titles:
@@ -5023,6 +5765,36 @@ def _anime_cache_put(key, rec: dict) -> None:
     _ANIME_CACHE.move_to_end(key)
     if len(_ANIME_CACHE) > _CACHE_MAX:
         _ANIME_CACHE.popitem(last=False)
+
+
+def _anime_episode_conflict(p: dict, media: dict):
+    """An anime authority's entry must FIT the file. A file that is episode 25 cannot be an entry with two episodes:
+    "FORBIDDEN LOVE | Episode 25" (a Hindi serial dubbed in English) is not the 2003 OVA "Forbidden Love" that only shares
+    its title. Only a gross mismatch counts (the episode number is more than twice the entry's episode count + 10), so
+    absolute numbering across seasons and split entries still fits; an unknown count (a show still airing) never
+    conflicts, and a fansub-tagged / known-anime-group name (a STRONG candidate) is not asked. Returns a reason or None."""
+    ap = p.get("anime") or {}
+    if ap.get("strong"):
+        return None
+    n, eps = p.get("episode") or ap.get("episode"), media.get("episodes")
+    if isinstance(n, bool) or not isinstance(n, int) or isinstance(eps, bool) or not isinstance(eps, int) or eps <= 0:
+        return None
+    if n <= eps * 2 + 10:
+        return None
+    return f"the file is episode {n} but that entry has only {eps} episode{'s' if eps != 1 else ''}"
+
+
+async def _anime_lookup(session, p: dict, anilist_key: str, use_anilist: bool, minutes=None) -> dict:
+    """_anime_lookup_core() plus the per-file fit check: a "found" entry that cannot be this file
+    (_anime_episode_conflict) becomes status "episode-skip" - nothing found, the reason in d["skip"]. The check runs
+    here, after the per-show verdict cache, because it depends on the file's episode number and not on the show."""
+    res = await _anime_lookup_core(session, p, anilist_key, use_anilist, minutes)
+    if res["status"] == "found":
+        why = _anime_episode_conflict(p, res["media"])
+        if why:
+            return {"status": "episode-skip", "source": res["source"], "media": None, "d": {"skip": why},
+                    "cached": res["cached"]}
+    return res
 
 
 def _anime_year_conflict(p: dict, media: dict):
@@ -5090,6 +5862,8 @@ async def _anime_first_pass(session, parsed, use_anilist: bool, anilist_key: str
             continue
         res = await _anime_lookup(session, p, anilist_key, use_anilist, minutes)
         a = _anime_note(info, anilist=res["status"])
+        if res["status"] == "episode-skip":
+            a.setdefault("notes", []).append("anilist-first skipped: " + res["d"]["skip"])
         if res["status"] != "found":
             continue
         why = _anime_year_conflict(p, res["media"])
