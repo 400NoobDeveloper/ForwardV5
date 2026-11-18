@@ -391,7 +391,7 @@ def _progress_text(stats: dict, mapping: dict, pacing: dict, total_files: int, s
         stats["filtered"], status, "{:.1f}".format(pct), _format_duration(eta), progress,
     )
     if status == "completed":
-        text = _with_other_because(text, stats)
+        text = _with_sources(_with_other_because(text, stats), stats)
     return text
 
 
@@ -404,6 +404,88 @@ def _with_other_because(text: str, stats: dict) -> str:
     top = sorted(why.items(), key=lambda kv: (-kv[1], kv[0]))[:6]
     block = "\n\n<b>Other because:</b> " + ", ".join(f"{k} {n}" for k, n in top)
     return text + block if len(text) + len(block) <= 4096 else text
+
+
+# ── Which identification sources worked in this run ("Sources:" line of the completed message) ──
+_SERVICE_HOSTS = {"api.themoviedb.org": "tmdb", "graphql.anilist.co": "anilist", "api.jikan.moe": "jikan",
+                  "api.tvmaze.com": "tvmaze", "www.wikidata.org": "wikidata", "v3.sg.media-imdb.com": "imdb",
+                  "www.omdbapi.com": "omdb"}
+
+
+class _CountedRequest:
+    """`async with session.get(...) as resp`, counted: one call per request, one error when it raised or answered HTTP >= 400."""
+
+    def __init__(self, cm, bucket: list):
+        self._cm, self._bucket = cm, bucket
+
+    async def __aenter__(self):
+        try:
+            resp = await self._cm.__aenter__()
+        except Exception:
+            self._bucket[0] += 1
+            self._bucket[1] += 1
+            raise
+        self._bucket[0] += 1
+        if (getattr(resp, "status", 200) or 200) >= 400:
+            self._bucket[1] += 1
+        return resp
+
+    async def __aexit__(self, *exc):
+        return await self._cm.__aexit__(*exc)
+
+
+class _CountingSession:
+    """The run's aiohttp session. It counts the requests per service - [calls, errors] in `calls` - and passes everything
+    else through, so the classifier and the movie gate use it exactly like the plain session."""
+
+    def __init__(self, session, calls: dict):
+        self._session, self._calls = session, calls
+
+    def _bucket(self, url) -> list:
+        parts = str(url).split("/")
+        return self._calls.setdefault(_SERVICE_HOSTS.get(parts[2] if len(parts) > 2 else "", "other"), [0, 0])
+
+    def get(self, url, **kw):
+        return _CountedRequest(self._session.get(url, **kw), self._bucket(url))
+
+    def post(self, url, **kw):
+        return _CountedRequest(self._session.post(url, **kw), self._bucket(url))
+
+    async def close(self):
+        await self._session.close()
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+
+def _count_hit(stats: dict, classified: str, info: dict) -> None:
+    """A file the classifier identified through IMDb / OMDb, TVmaze or Wikidata is one "hit" of that source."""
+    if classified.startswith("series"):
+        src = (info.get("series") or {}).get("source")
+    elif classified.startswith(("movie", "anime")):
+        src = (info.get("movie") or {}).get("source")
+    else:
+        return
+    key = {"imdb": "imdb", "omdb": "imdb", "tvmaze": "tvmaze", "wikidata": "wikidata"}.get(src)
+    if key:
+        hits = stats.setdefault("hits", {})
+        hits[key] = hits.get(key, 0) + 1
+
+
+def _with_sources(text: str, stats: dict) -> str:
+    """The final "completed" message only: ONE line, "Sources: TMDB 412 calls / 3 errors · AniList 120 calls / 0 errors
+    (or OFF) · IMDb 4 hits · TVmaze 7 hits · Wikidata 2 hits". Calls / errors are the HTTP requests of the run; a hit is a
+    file that source identified."""
+    calls, hits = stats.get("calls") or {}, stats.get("hits") or {}
+
+    def ce(name: str) -> str:
+        n, e = calls.get(name, (0, 0))
+        return f"{n} calls / {e} errors"
+
+    anilist = ce("anilist") if stats.get("anilist_on") else "OFF"
+    line = (f"\n\n<b>Sources:</b> TMDB {ce('tmdb')} · AniList {anilist} · IMDb {hits.get('imdb', 0)} hits · "
+            f"TVmaze {hits.get('tvmaze', 0)} hits · Wikidata {hits.get('wikidata', 0)} hits")
+    return text + line if len(text) + len(line) <= 4096 else text
 
 
 def _status_markup(state: str) -> InlineKeyboardMarkup:
@@ -593,6 +675,7 @@ def _series_gate(message, category, info):
       1. no thumbnail at all (SERIES_REQUIRE_THUMB)  -> a thumbnail-less file is not an episode
       2. duration known and < SERIES_MIN_MINUTES     -> a clip, promo or teaser
       3. duration known and > SERIES_MAX_MINUTES     -> a compilation, marathon or film
+                                                        (not for a season pack, "S01 Combined": that IS long)
       4. thumbnail ratio outside the band / unknown  -> poster / square / portrait thumbnail
     All four apply to a NATIVE video only: a video sent as a document has no preview size and no
     duration in Telegram, so it skips them all. A split part skips 2 and 3 (SPLIT_PARTS_SKIP_DURATION);
@@ -604,6 +687,7 @@ def _series_gate(message, category, info):
     ratio_hit, ratio, source, minutes, thumb (does the file have a thumbnail)."""
     native = getattr(message, "video", None) is not None
     split = native and SPLIT_PARTS_SKIP_DURATION and is_split_video_part(message)
+    pack = bool((info.get("series") or {}).get("season_pack"))      # "S01 Combined / Complete": a whole season in one file
     if native:
         ok, ratio, source = movie_thumb_gate(
             message, SERIES_THUMB_RATIO_MIN, SERIES_THUMB_RATIO_MAX, SERIES_RATIO_UNKNOWN,
@@ -617,7 +701,7 @@ def _series_gate(message, category, info):
         reason = "no thumbnail -> other"
     elif minutes is not None and not split and minutes < SERIES_MIN_MINUTES:
         reason, why = f"duration {minutes:.0f}m below {SERIES_MIN_MINUTES:g}m -> other", "duration"
-    elif minutes is not None and not split and minutes > SERIES_MAX_MINUTES:
+    elif minutes is not None and not split and not pack and minutes > SERIES_MAX_MINUTES:
         reason, why = f"duration {minutes:.0f}m above {SERIES_MAX_MINUTES:g}m -> other", "duration"
     elif not ok:
         ratio_hit, why = True, "ratio"
@@ -647,6 +731,10 @@ def _log_series_route(message, classified, gated, final, gate, info):
         notes.append(s["reason"])
     if s.get("ambiguous"):
         notes.append("ambiguous franchise version")
+    if s.get("season_pack"):
+        notes.append("season pack")
+    if s.get("tv_source"):
+        notes.append("tv-source tag")
     if final != gated:
         notes.append("no channel mapped -> other")
     gate = gate or {}
@@ -770,6 +858,8 @@ def _log_anime_route(message, classified, gated, final, gate, info):
 #   unidentified  the name has no usable title, or the classifier gave up without a better reason
 #   not_found     the title was searched (TMDB / TVmaze / Wikidata ...) and nothing matched
 #   extra         sample / trailer / promo / recap / NCOP-style name
+#   education_vetoed  course words in the name, but a source knows the show (the veto is kept, nothing says "course")
+#   season_pack   a season pack ("S01 Combined") of a show no source vouches for, and the marker alone did not pass
 #   archive       (the classifier's reason for an archive; it goes to the Files channel, and to Other as
 #                 "unmapped" when no Files channel is mapped)
 #   other_type    not a video / pdf / image / audio / archive, or copy_message could not rebuild it
@@ -803,17 +893,22 @@ async def _run(client, user_id, m, cfg):
     mapping = cfg["mapping"]
     from_chat = cfg["from_chat"]
     stats = {"fetched": 0, "forwarded": 0, "unsorted": 0, "errors": 0, "filtered": 0, "fallback": 0, "duplicate": 0,
-             "ratio_other": 0, UNIDENTIFIED: 0, TMDB_UNAVAILABLE: 0, "other_why": {}, "start": time.time()}
+             "ratio_other": 0, UNIDENTIFIED: 0, TMDB_UNAVAILABLE: 0, "other_why": {}, "calls": {}, "hits": {},
+             "anilist_on": False, "start": time.time()}
     for category in mapping:
         stats[category] = 0
 
     total_files = max(int(cfg["last_msg_id"]) - int(cfg["skip"]), 1)
     pacing = {"delay": _base_delay(total_files), "min": _base_delay(total_files), "floodwaits": 0, "streak": 0}
 
-    tmdb_session = aiohttp.ClientSession() if aiohttp else None
+    tmdb_session = _CountingSession(aiohttp.ClientSession(), stats["calls"]) if aiohttp else None
     tmdb_key = await db.get_tmdb_key(user_id)
     use_anilist = await db.get_anilist_enabled(user_id)
     anilist_key = await db.get_anilist_key(user_id)
+    stats["anilist_on"] = bool(use_anilist)
+    if not use_anilist:
+        logger.info("autosort: AniList is OFF for this run (/settings): anime candidates are checked with TMDB, "
+                    "the anime list and Jikan only")
     # /settings -> Filters enforcement (message type toggles, extension
     # exclude-list, keyword include-list, file size limit, movie/series
     # whitelists) - see plugins/utils.py's check_filters(). Duplicate
@@ -906,6 +1001,7 @@ async def _run(client, user_id, m, cfg):
                 skipped = category
                 category = "other"
             classified = category
+            _count_hit(stats, classified, info)
             # Movie channel gate (duration / thumbnail ratio / TMDB runtime). Done
             # here, not in classify_async(), which /fwd shares. A file that fails
             # is not dropped, filtered or counted as an error: it goes to Other.
