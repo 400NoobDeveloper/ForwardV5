@@ -23,9 +23,7 @@
 # goes to Other. The Anime channel has the same kind of gate (see _anime_gate()): only files
 # identified as real anime (AniList / Jikan / TMDB / anime list, see plugins/classify.py
 # "deep ANIME identification") with a thumbnail, a normal length and a landscape thumbnail
-# shape go there; the rest goes to Other. The Education channel has one too (see
-# _education_gate()): a native education video needs a thumbnail and a landscape thumbnail
-# shape (no duration limits - lectures are long); education_files is never gated.
+# shape go there; the rest goes to Other.
 # Everything else that can't be sorted into a specific
 # category (no channel mapped for it, TMDB unreachable, unsupported
 # message type, ...) is added to the "Other" channel, so nothing has
@@ -37,8 +35,16 @@
 #     do not apply to it.
 #   * A split part (".part004.mkv") is a slice of a film: the duration guard and the TMDB runtime
 #     check skip it (SPLIT_PARTS_SKIP_DURATION, default on); the thumbnail rules still apply.
-#   * A season pack ("S01", "S01 Complete") skips the maximum-duration check of the series / anime
-#     gates (SEASONPACK_SKIP_MAX_DURATION, default on): a whole season in one file is long by design.
+#   * ONE thumbnail rule for ALL native-video channels (Movies, Series, Anime, Education): a video with NO
+#     thumbnail (the video's own width / height never rescues it) or with a thumbnail outside the landscape band
+#     goes to Other (reasons no_thumb / ratio, the "Ratio->Other" counter). Movies: MOVIE_REQUIRE_THUMB (default
+#     on); Education: EDUCATION_REQUIRE_THUMB, EDUCATION_THUMB_RATIO_MIN/MAX, EDUCATION_RATIO_UNKNOWN (video only,
+#     no duration limits, "education_files" documents are never gated).
+#   * A season pack ("S01", "Season 1", Complete / Batch ...) is a whole season in one file: SERIES_MAX_MINUTES /
+#     ANIME_MAX_MINUTES do not apply to it (SEASONPACK_SKIP_MAX_DURATION, default on); the minimum length, the
+#     thumbnail and the ratio rules still do.
+#   * /autosort's confirmation message says whether AniList is ON; when it is OFF it offers an "Enable AniList"
+#     button above Yes / No (AUTOSORT_ASK_ANILIST, default on).
 #   * A TMDB outage is retried (AUTOSORT_TMDB_RETRIES, default 2, after ~3 s and ~8 s) before the
 #     file goes to Other.
 #   * Every file that ends in Other gets a reason (stats["other_why"], one "autosort other-route"
@@ -65,18 +71,20 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from core.database import db
 from core.config import temp
-from plugins.controls import Translation, CLIENT, start_clone_bot, target_link, frwd_status_text
+from plugins.controls import Translation, CLIENT, start_clone_bot, target_link, frwd_status_text, _test_anilist
 from plugins.classify import (
     classify_async, CATEGORIES, VIDEO_CATEGORIES, SKIP_CATEGORIES,
     UNIDENTIFIED, TMDB_UNAVAILABLE, ENV_TMDB_API_KEY,
     get_filename, movie_thumb_gate, movie_duration_minutes, tmdb_movie_runtime, runtime_mismatch, has_video_thumb,
-    is_split_video_part, SPLIT_PARTS_SKIP_DURATION, anilist_lookup,
-    MOVIE_MIN_MINUTES, MOVIE_THUMB_RATIO_MIN, MOVIE_THUMB_RATIO_MAX, MOVIE_REQUIRE_THUMB,
+    is_split_video_part, SPLIT_PARTS_SKIP_DURATION,
+    MOVIE_MIN_MINUTES, MOVIE_THUMB_RATIO_MIN, MOVIE_THUMB_RATIO_MAX,
     SERIES_MIN_MINUTES, SERIES_MAX_MINUTES, SERIES_THUMB_RATIO_MIN, SERIES_THUMB_RATIO_MAX, SERIES_RATIO_UNKNOWN,
-    SERIES_REQUIRE_THUMB, SEASONPACK_SKIP_MAX_DURATION,
+    SERIES_REQUIRE_THUMB,
     ANIME_MIN_MINUTES, ANIME_MAX_MINUTES, ANIME_THUMB_RATIO_MIN, ANIME_THUMB_RATIO_MAX, ANIME_RATIO_UNKNOWN,
     ANIME_REQUIRE_THUMB,
-    EDUCATION_THUMB_RATIO_MIN, EDUCATION_THUMB_RATIO_MAX, EDUCATION_RATIO_UNKNOWN, EDUCATION_REQUIRE_THUMB,
+    MOVIE_REQUIRE_THUMB, EDUCATION_REQUIRE_THUMB, EDUCATION_THUMB_GATE,
+    EDUCATION_THUMB_RATIO_MIN, EDUCATION_THUMB_RATIO_MAX, EDUCATION_RATIO_UNKNOWN,
+    SEASONPACK_SKIP_MAX_DURATION,
 )
 from pyrogram.enums import ParseMode
 from plugins.utils import check_filters, caption_for_copy, text_without_links
@@ -95,6 +103,10 @@ CLIENT = CLIENT()
 # plugins/utils.py's STS, just scoped to this one command.
 _PENDING: dict = {}
 _next_id = 0
+
+# AUTOSORT_ASK_ANILIST=1 (default): the /autosort confirmation message says whether AniList is ON for this user and, when
+# it is OFF, offers an "Enable AniList" button above Yes / No. 0 = the old message, no AniList line, no button.
+AUTOSORT_ASK_ANILIST = os.environ.get("AUTOSORT_ASK_ANILIST", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 def _new_run_id() -> str:
@@ -267,26 +279,31 @@ async def autosort_cmd(bot: Client, message):
     est_delay = _base_delay(total_files)
     est_seconds = total_files * est_delay
 
-    # AniList needs NO API key (the public GraphQL is keyless; the token in /settings ->
-    # Private Files -> AniList is optional). It is the anime authority: with it OFF, anime-style
-    # shows can land in Series or Movies (Blue Eye Samurai is the example). So ask BEFORE the run
-    # starts. The existing Yes still starts the run without it, exactly as before.
-    anilist_on = bool(await db.get_anilist_enabled(user_id))
-    buttons = []
-    if anilist_on:
-        anilist_note = "<b>AniList:</b> <code>ON</code>\n\n"
-    else:
-        anilist_note = (
-            "<b>⚠️ AniList is OFF:</b> anime can land in Series or Movies. "
-            "AniList needs no API key (the token in Private Files is optional).\n"
-            "Tap <b>Enable AniList</b> below, or Yes to run without it.\n\n"
-        )
-        buttons.append([InlineKeyboardButton('Enable AniList', callback_data=f"autosort_anion_{run_id}")])
-    buttons.append([
+    buttons = [[
         InlineKeyboardButton('Yes', callback_data=f"autosort_start_{run_id}"),
         InlineKeyboardButton('No', callback_data="close_btn"),
-    ])
-    await message.reply_text(
+    ]]
+
+    # AniList status (no network call): ON = one status line; OFF = a warning and an "Enable AniList" row ABOVE Yes / No.
+    # Yes still starts the run exactly as before (without AniList when it is off). Never raises: on any problem the
+    # message is the old one.
+    anilist_note = ""
+    if AUTOSORT_ASK_ANILIST:
+        try:
+            if await db.get_anilist_enabled(user_id):
+                anilist_note = "<b>AniList:</b> ON <i>(anime are checked against AniList)</i>\n\n"
+            else:
+                anilist_note = (
+                    "<b>⚠️ AniList is OFF:</b> anime can land in Series or Movies. AniList needs no API key "
+                    "(the token in Private Files is optional). Tap <b>Enable AniList</b> to turn it on, "
+                    "or Yes to start without it.\n\n"
+                )
+                buttons.insert(0, [InlineKeyboardButton("Enable AniList", callback_data=f"autosort_anion_{run_id}")])
+        except Exception as e:
+            logger.warning("autosort: could not read the AniList setting (%s) - confirmation without the AniList line", e)
+            anilist_note = ""
+
+    text_head = (
         f"<b>DOUBLE CHECKING ⚠️</b>\n\n"
         f"<b>FROM CHANNEL:</b> <code>{title}</code>\n"
         f"<b>SKIP MESSAGES:</b> <code>{skipno.text}</code>\n"
@@ -294,13 +311,59 @@ async def autosort_cmd(bot: Client, message):
         f"<b>ESTIMATED TIME:</b> <code>~{_format_duration(est_seconds)}</code> "
         f"<i>(paced automatically, speeds up/slows down live to dodge FloodWaits)</i>\n\n"
         f"<b>Routing:</b>\n{mapping_lines}{unmapped_note}\n\n"
+    )
+    text_tail = (
         f"<i>{dup_note} Anything your /settings filters exclude is skipped. "
         f"Everything else is forwarded.</i>\n\n"
         f"<i>Your bot/userbot must be admin in every destination channel listed above.</i>\n\n"
-        f"{anilist_note}"
-        f"Click Yes to start.",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        f"Click Yes to start."
     )
+    _PENDING[run_id]["text_head"], _PENDING[run_id]["text_tail"] = text_head, text_tail   # for "Enable AniList" below
+    await message.reply_text(text_head + anilist_note + text_tail, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+@Client.on_callback_query(filters.regex(r"^autosort_anion_(.+)$"))
+async def autosort_anion(bot: Client, query):
+    """"Enable AniList" button of the /autosort confirmation: turns the user's AniList toggle ON, checks once that AniList
+    answers (the SAME check as the Private Files -> AniList TEST button, 8 s, never raises), and shows the normal Yes / No
+    keyboard again. The pending run is NOT consumed: Yes (autosort_start) still starts it."""
+    user_id = query.from_user.id
+    run_id = query.matches[0].group(1)
+    cfg = _PENDING.get(run_id)
+    if not cfg or cfg["owner"] != user_id:
+        return await query.answer("This button has expired.", show_alert=True)
+
+    try:
+        await db.set_anilist_enabled(user_id, True)
+    except Exception as e:
+        logger.warning("autosort: could not turn AniList on for user %s: %s", user_id, e)
+        return await query.answer("Could not turn AniList on. Try again, or use /settings -> Private Files -> AniList.",
+                                  show_alert=True)
+    try:
+        await query.answer("AniList enabled. Checking it...")
+    except Exception:
+        pass
+
+    reachable = False
+    try:
+        reachable, _detail = await asyncio.wait_for(_test_anilist(await db.get_anilist_key(user_id)), timeout=8)
+    except Exception as e:                       # includes asyncio.TimeoutError: "not reachable" is an answer, not an error
+        logger.info("autosort: AniList reachability check failed for user %s: %s", user_id, e)
+        reachable = False
+
+    status = ("<b>✅ AniList enabled.</b> AniList is reachable.\n\n" if reachable else
+              "<b>✅ AniList enabled.</b> AniList is not reachable right now - Jikan (MyAnimeList) is used until it answers.\n\n")
+    text = (cfg.get("text_head") or "<b>DOUBLE CHECKING ⚠️</b>\n\n") + status + (cfg.get("text_tail") or "Click Yes to start.")
+    buttons = [[
+        InlineKeyboardButton('Yes', callback_data=f"autosort_start_{run_id}"),
+        InlineKeyboardButton('No', callback_data="close_btn"),
+    ]]
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    except MessageNotModified:
+        pass
+    except Exception as e:
+        logger.warning("autosort: could not update the confirmation message: %s", e)
 
 
 @Client.on_callback_query(filters.regex(r"^autosort_start_(.+)$"))
@@ -353,54 +416,6 @@ async def autosort_start(bot: Client, query):
     temp.CANCEL[user_id] = False
 
     await _run(client, user_id, m, cfg)
-
-
-@Client.on_callback_query(filters.regex(r"^autosort_anion_(.+)$"))
-async def autosort_enable_anilist(bot: Client, query):
-    """The 'Enable AniList' button of the /autosort confirmation message.
-
-    Turns the per-user AniList toggle ON, does ONE reachability check with the SAME function the
-    /settings -> AniList TEST button uses (anilist_lookup: 8 s timeout, never raises), then shows
-    the normal Yes / No keyboard so the user still confirms the start. The pending run config is
-    NOT popped here - autosort_start pops it when Yes is tapped."""
-    user_id = query.from_user.id
-    run_id = query.matches[0].group(1)
-    cfg = _PENDING.get(run_id)
-    if not cfg or cfg["owner"] != user_id:
-        return await query.answer("This button has expired.", show_alert=True)
-
-    try:
-        await db.set_anilist_enabled(user_id, True)
-    except Exception as e:
-        logger.warning("autosort anilist enable failed: %s", e)
-        return await query.answer("Couldn't enable AniList - please try again.", show_alert=True)
-
-    reachable = False
-    try:
-        anilist_key = await db.get_anilist_key(user_id)
-        status, _media = await asyncio.wait_for(anilist_lookup("One Piece", anilist_key=anilist_key), timeout=8)
-        reachable = status in ("found", "none")
-    except Exception as e:
-        logger.debug("autosort anilist reachability check failed: %s", e)
-
-    text = ("<b>AniList enabled.</b>\n\n"
-            + ("✅ AniList is reachable; anime candidates will be checked against it first.\n"
-               if reachable
-               else "⚠️ AniList is not reachable right now. Jikan (MyAnimeList) will be used instead.\n")
-            + "\nClick <b>Yes</b> to start.")
-    try:
-        await query.message.edit_text(
-            text,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton('Yes', callback_data=f"autosort_start_{run_id}"),
-                InlineKeyboardButton('No', callback_data="close_btn"),
-            ]]),
-        )
-    except MessageNotModified:
-        pass
-    except Exception as e:
-        logger.debug("autosort anilist button edit failed: %s", e)
-    await query.answer("AniList enabled.")
 
 
 async def _notify(client, user_id, text, mapping):
@@ -528,7 +543,11 @@ class _CountingSession:
 
 
 def _count_hit(stats: dict, classified: str, info: dict) -> None:
-    """A file the classifier identified through IMDb / OMDb, TVmaze or Wikidata is one "hit" of that source."""
+    """A file the classifier identified through IMDb / OMDb, TVmaze or Wikidata is one "hit" of that source (and one
+    identified as anime by the offline anime database is a hit of "offline")."""
+    if classified.startswith("anime") and (info.get("anime") or {}).get("source") == "offline":
+        hits = stats.setdefault("hits", {})
+        hits["offline"] = hits.get("offline", 0) + 1
     if classified.startswith("series"):
         src = (info.get("series") or {}).get("source")
     elif classified.startswith(("movie", "anime")):
@@ -554,6 +573,8 @@ def _with_sources(text: str, stats: dict) -> str:
     anilist = ce("anilist") if stats.get("anilist_on") else "OFF"
     line = (f"\n\n<b>Sources:</b> TMDB {ce('tmdb')} · AniList {anilist} · IMDb {hits.get('imdb', 0)} hits · "
             f"TVmaze {hits.get('tvmaze', 0)} hits · Wikidata {hits.get('wikidata', 0)} hits")
+    if hits.get("offline"):
+        line += f" · Offline anime DB {hits['offline']} hits"
     return text + line if len(text) + len(line) <= 4096 else text
 
 
@@ -575,8 +596,8 @@ def _category_popup(stats: dict, mapping: dict) -> str:
     for base, name in _POPUP_PAIRS:
         if base in mapping or f"{base}_files" in mapping:
             lines.append(f"{name} {stats.get(base, 0)}/{stats.get(base + '_files', 0)}")
-            if base in ("movie", "series", "education") and not ratio_shown:
-                # movies / series / education videos sent to Other by the thumbnail gates (one shared count)
+            if base in ("movie", "series") and not ratio_shown:
+                # movies / series sent to Other by the thumbnail-ratio gates (one shared count)
                 lines.append(f"Ratio→Other {stats.get('ratio_other', 0)}")
                 ratio_shown = True
     for key, name in _POPUP_SINGLES:
@@ -663,30 +684,35 @@ MOVIE_GATE_CATEGORIES = ("movie", "movie_files")
 async def _movie_gate(message, category, info, session, tmdb_key):
     """Checks a file the classifier called movie / movie_files. First failure
     wins and the file becomes "other" (never dropped):
-      1. no thumbnail at all (MOVIE_REQUIRE_THUMB)  -> a thumbnail-less file is not a movie
-      2. duration known and < MOVIE_MIN_MINUTES     -> a clip, trailer or short
-      3. thumbnail ratio outside the band / unknown -> poster-style thumbnail
-      4. duration vs TMDB runtime off by > tolerance -> not that film
-    All four apply to a NATIVE video only. A video sent as a document has no preview size and no
+      1. duration known and < MOVIE_MIN_MINUTES     -> a clip, trailer or short
+      1b. no thumbnail at all (MOVIE_REQUIRE_THUMB) -> a thumbnail-less video is not a movie (reason no_thumb)
+      2. thumbnail ratio outside the band / unknown -> poster-style thumbnail
+      3. duration vs TMDB runtime off by > tolerance -> not that film
+    These three apply to a NATIVE video only. A video sent as a document has no preview size and no
     duration in Telegram, so it skips all of them. A split part (".part004.mkv") is only a slice of the
-    film: it skips 2 and 4 (SPLIT_PARTS_SKIP_DURATION), the thumbnail rules (1, 3) still apply.
-    The video's own width / height never rescues a missing thumbnail (MOVIE_REQUIRE_THUMB).
+    film: it skips 1 and 3 (SPLIT_PARTS_SKIP_DURATION), the thumbnail rule (2) still applies.
     Returns a dict: category (final), reason (None = unchanged), why (no_thumb | duration | ratio |
-    runtime), ratio_hit (failed on the ratio / thumbnail gate), ratio, source, minutes, tmdb_id."""
+    runtime), ratio_hit (failed on the ratio gate), ratio, source, minutes, tmdb_id."""
     native = getattr(message, "video", None) is not None
     split = native and SPLIT_PARTS_SKIP_DURATION and is_split_video_part(message)
     if native:
-        ok, ratio, source = movie_thumb_gate(message, require_thumb=MOVIE_REQUIRE_THUMB)
+        try:
+            # MOVIE_REQUIRE_THUMB (default on): a video with NO thumbnail is not a movie - its own width / height never
+            # rescues it (the same rule as the series / anime gates)
+            ok, ratio, source = movie_thumb_gate(message, require_thumb=MOVIE_REQUIRE_THUMB)
+        except Exception as e:
+            logger.warning("autosort: movie thumbnail rule failed (%s) - old behaviour for this file", e)
+            ok, ratio, source = movie_thumb_gate(message)
         minutes = movie_duration_minutes(message)
     else:
         ok, ratio, source, minutes = True, None, "document", None
     tmdb_id = info.get("tmdb_id") if info.get("tmdb_media") == "movie" else None
     reason, why, ratio_hit = None, None, False
-    if source == "no-thumb":
+    if minutes is not None and not split and minutes < MOVIE_MIN_MINUTES:
+        reason, why = f"duration {minutes:.0f}m -> other", "duration"
+    elif source == "no-thumb":
         ratio_hit, why = True, "no_thumb"
         reason = "no thumbnail -> other"
-    elif minutes is not None and not split and minutes < MOVIE_MIN_MINUTES:
-        reason, why = f"duration {minutes:.0f}m -> other", "duration"
     elif not ok:
         ratio_hit, why = True, "ratio"
         if ratio is None:
@@ -761,8 +787,9 @@ def _series_gate(message, category, info):
     ratio_hit, ratio, source, minutes, thumb (does the file have a thumbnail)."""
     native = getattr(message, "video", None) is not None
     split = native and SPLIT_PARTS_SKIP_DURATION and is_split_video_part(message)
-    # "S01 Combined / Complete": a whole season in one file - the maximum-duration check is skipped
-    pack = bool((info.get("series") or {}).get("season_pack")) and SEASONPACK_SKIP_MAX_DURATION
+    pack = bool((info.get("series") or {}).get("season_pack"))      # "S01 Combined / Complete": a whole season in one file
+    if SEASONPACK_SKIP_MAX_DURATION and (info.get("series") or {}).get("pack"):
+        pack = True                                                 # any season pack ("S01", "Season 1", Batch ...) is long by nature
     if native:
         ok, ratio, source = movie_thumb_gate(
             message, SERIES_THUMB_RATIO_MIN, SERIES_THUMB_RATIO_MAX, SERIES_RATIO_UNKNOWN,
@@ -806,7 +833,7 @@ def _log_series_route(message, classified, gated, final, gate, info):
         notes.append(s["reason"])
     if s.get("ambiguous"):
         notes.append("ambiguous franchise version")
-    if s.get("season_pack"):
+    if s.get("season_pack") or s.get("pack"):
         notes.append("season pack")
     if s.get("tv_source"):
         notes.append("tv-source tag")
@@ -852,7 +879,7 @@ def _anime_gate(message, category, info):
       1. no thumbnail at all (ANIME_REQUIRE_THUMB)  -> a blank preview is not a proper episode
       2. duration known and < ANIME_MIN_MINUTES     -> a clip, opening, AMV
       3. duration known and > ANIME_MAX_MINUTES     -> a compilation or marathon
-                                                        (not for a season pack: "S01" is a whole season in one file)
+                                                        (not for a season pack, "S01": that IS long - SEASONPACK_SKIP_MAX_DURATION)
       4. thumbnail ratio outside the band / unknown -> poster / portrait / square thumbnail
     All four apply to a NATIVE video only: a video sent as a document has no preview size and no
     duration in Telegram, so it skips them all. A split part skips 2 and 3 (SPLIT_PARTS_SKIP_DURATION);
@@ -863,9 +890,8 @@ def _anime_gate(message, category, info):
     ratio_hit, ratio, source, minutes, thumb (does the file have a thumbnail)."""
     native = getattr(message, "video", None) is not None
     split = native and SPLIT_PARTS_SKIP_DURATION and is_split_video_part(message)
-    # a season pack ("S01", "S01 Complete") is a whole season in one file: the maximum-duration check is skipped
-    pack = bool((info.get("anime") or {}).get("season_pack") or (info.get("series") or {}).get("season_pack"))
-    skip_max = split or (pack and SEASONPACK_SKIP_MAX_DURATION)
+    # a season pack ("My Hero Academia S01 ... Multi Audio") is a whole season in one file: ANIME_MAX_MINUTES does not apply
+    pack = bool(SEASONPACK_SKIP_MAX_DURATION and ((info.get("anime") or {}).get("pack") or (info.get("series") or {}).get("pack")))
     if native:
         ok, ratio, source = movie_thumb_gate(
             message, ANIME_THUMB_RATIO_MIN, ANIME_THUMB_RATIO_MAX, ANIME_RATIO_UNKNOWN,
@@ -879,7 +905,7 @@ def _anime_gate(message, category, info):
         reason = "no thumbnail -> other"
     elif minutes is not None and not split and minutes < ANIME_MIN_MINUTES:
         reason, why = f"duration {minutes:.1f}m below {ANIME_MIN_MINUTES:g}m -> other", "duration"
-    elif minutes is not None and not skip_max and minutes > ANIME_MAX_MINUTES:
+    elif minutes is not None and not split and not pack and minutes > ANIME_MAX_MINUTES:
         reason, why = f"duration {minutes:.0f}m above {ANIME_MAX_MINUTES:g}m -> other", "duration"
     elif not ok:
         ratio_hit, why = True, "ratio"
@@ -908,6 +934,8 @@ def _log_anime_route(message, classified, gated, final, gate, info):
     if a.get("downgraded"):
         notes.append("downgraded: " + a["downgraded"])
     notes += list(a.get("notes") or [])
+    if a.get("pack"):
+        notes.append("season pack")
     if final != gated:
         notes.append("no channel mapped -> other")
     gate = gate or {}
@@ -930,32 +958,30 @@ def _log_anime_route(message, classified, gated, final, gate, info):
     )
 
 
-# ── Education-channel gate ─────────────────────────────────
-# Only a NATIVE video (message.video) is judged, and only the "education" category - never
-# "education_files": a document has no preview size and no duration in Telegram. No duration
-# limits: a lecture is long. Same style as _series_gate().
+# ── Education-channel gate ──────────────────────────────────
+# Same shared thumbnail rule as the other native-video channels, for the education VIDEO channel only: an
+# "education_files" document is never gated. No duration limits (a lecture can be any length).
 EDUCATION_GATE_CATEGORIES = ("education",)
 
 
 def _education_gate(message, category, info):
-    """Checks a file the classifier called education (Video). First failure wins and the file
-    becomes "other" (never dropped):
-      1. no thumbnail at all (EDUCATION_REQUIRE_THUMB)  -> a blank preview is not a lecture
-      2. duration / ratio: no duration limits for education (lectures are long);
-         thumbnail ratio outside EDUCATION_THUMB_RATIO_MIN..MAX / unknown -> poster / square thumbnail
-    The video's own width / height never rescues a missing thumbnail. A document (education_files)
-    is never gated here. No thumbnail counts as a thumbnail reject (ratio_hit), so it shares the
-    "Ratio->Other" counter.
-    Returns a dict: category (final), reason (None = unchanged), why (no_thumb | ratio), ratio_hit,
+    """Checks a file the classifier called education (a NATIVE video). First failure wins and the file becomes
+    "other" (never dropped):
+      1. no thumbnail at all (EDUCATION_REQUIRE_THUMB) -> the video's own width / height never rescues it (no_thumb)
+      2. thumbnail ratio outside EDUCATION_THUMB_RATIO_MIN..MAX (default 1.30..2.40) or unknown
+         (EDUCATION_RATIO_UNKNOWN, default other) -> poster / portrait / square thumbnail (ratio)
+    No duration rule. A document ("education_files") is not gated; EDUCATION_THUMB_GATE=0 switches the gate off.
+    No thumbnail counts as a thumbnail reject (ratio_hit), so it shares the "Ratio->Other" counter.
+    Returns a dict like _series_gate(): category (final), reason (None = unchanged), why (no_thumb | ratio), ratio_hit,
     ratio, source, minutes, thumb."""
     native = getattr(message, "video", None) is not None
-    if not native:
-        return {"category": category, "reason": None, "why": None, "ratio_hit": False, "ratio": None,
-                "source": "document", "minutes": None, "thumb": False}
-    ok, ratio, source = movie_thumb_gate(
-        message, EDUCATION_THUMB_RATIO_MIN, EDUCATION_THUMB_RATIO_MAX, EDUCATION_RATIO_UNKNOWN,
-        require_thumb=EDUCATION_REQUIRE_THUMB)
-    minutes = movie_duration_minutes(message)
+    if native and EDUCATION_THUMB_GATE:
+        ok, ratio, source = movie_thumb_gate(
+            message, EDUCATION_THUMB_RATIO_MIN, EDUCATION_THUMB_RATIO_MAX, EDUCATION_RATIO_UNKNOWN,
+            require_thumb=EDUCATION_REQUIRE_THUMB)
+    else:
+        ok, ratio, source = True, None, "document" if not native else "off"
+    minutes = movie_duration_minutes(message) if native else None
     reason, why, ratio_hit = None, None, False
     if source == "no-thumb":
         ratio_hit, why = True, "no_thumb"
@@ -967,27 +993,25 @@ def _education_gate(message, category, info):
         elif ratio < 1.0:
             reason = f"ratio {ratio:.2f} poster -> other"
         else:
-            reason = (f"ratio {ratio:.2f} outside {EDUCATION_THUMB_RATIO_MIN:g}-{EDUCATION_THUMB_RATIO_MAX:g}"
-                      f" -> other")
+            reason = f"ratio {ratio:.2f} outside {EDUCATION_THUMB_RATIO_MIN:g}-{EDUCATION_THUMB_RATIO_MAX:g} -> other"
     return {
         "category": "other" if reason else category, "reason": reason, "why": why, "ratio_hit": ratio_hit,
         "ratio": ratio, "source": source, "minutes": minutes, "thumb": has_video_thumb(message),
     }
 
 
-def _log_education_route(message, classified, gated, final, gate):
-    """ONE INFO line per education candidate (and per education file the gate moved to Other)."""
+def _log_education_route(message, classified, gated, final, gate, info):
+    """ONE INFO line per file the classifier called education: what it was, what the thumbnail looked like, where it went."""
+    gate = gate or {}
     notes = []
-    if gate and gate.get("reason"):
+    if gate.get("reason"):
         notes.append(gate["reason"])
     if final != gated:
         notes.append("no channel mapped -> other")
-    gate = gate or {}
     ratio, minutes = gate.get("ratio"), gate.get("minutes")
-    thumb = gate["thumb"] if "thumb" in gate else has_video_thumb(message)
     logger.info(
         "autosort education-route: msg=%s name=%r class=%s thumb=%s ratio=%s src=%s dur=%s final=%s reason=%s",
-        message.id, _movie_label(message), classified, "yes" if thumb else "no",
+        message.id, _movie_label(message), classified, "yes" if gate.get("thumb") else "no",
         f"{ratio:.2f}" if ratio is not None else "-", gate.get("source", "-"),
         f"{minutes:.0f}m" if minutes is not None else "-", final, "; ".join(notes) or "-",
     )
@@ -1005,12 +1029,11 @@ def _log_education_route(message, classified, gated, final, gate):
 #   archive       (the classifier's reason for an archive; it goes to the Files channel, and to Other as
 #                 "unmapped" when no Files channel is mapped)
 #   other_type    not a video / pdf / image / audio / archive, or copy_message could not rebuild it
-#   no_thumb | ratio | duration | runtime   a movie / series / anime / education gate rejected a NATIVE video
+#   no_thumb | ratio | duration | runtime   a movie / series / anime gate rejected a NATIVE video
 #   unmapped      the category is fine, but no channel is mapped for it in /settings
 def _other_why(skipped, classified, gated, final, gate, info):
     """(reason, detail) for a file that ended in Other. skipped = the SKIP category classify_async
-    returned (tmdb_error / unidentified) or None; gate = the movie / series / anime / education gate
-    dict or None."""
+    returned (tmdb_error / unidentified) or None; gate = the movie / series / anime gate dict or None."""
     if skipped == TMDB_UNAVAILABLE:
         n = info.get("tmdb_retries", 0)
         return "tmdb_error", f"TMDB did not answer ({n} retr{'y' if n == 1 else 'ies'})"
@@ -1161,9 +1184,13 @@ async def _run(client, user_id, m, cfg):
                 agate = _anime_gate(message, classified, info)
                 category = agate["category"]
             elif classified in EDUCATION_GATE_CATEGORIES:
-                # ... and the Education channel: a thumbnail and a landscape thumbnail (no duration limits).
-                egate = _education_gate(message, classified, info)
-                category = egate["category"]
+                # ... and for the Education VIDEO channel: a thumbnail of a landscape shape (no length rule).
+                try:
+                    egate = _education_gate(message, classified, info)
+                    category = egate["category"]
+                except Exception as e:                    # new rule: one warning, the old behaviour for this file
+                    logger.warning("autosort: education thumbnail rule failed for msg %s (%s) - not gated", message.id, e)
+                    egate = None
             gated = category
             dest = mapping.get(category)
             if dest is None:
@@ -1182,8 +1209,8 @@ async def _run(client, user_id, m, cfg):
                 _log_series_to_anime(message, classified, category, info)
             if classified.startswith("anime") or (info.get("anime") or {}).get("downgraded"):
                 _log_anime_route(message, classified, gated, category, agate or sgate or gate, info)
-            if classified.startswith("education"):
-                _log_education_route(message, classified, gated, category, egate)
+            if egate is not None:
+                _log_education_route(message, classified, gated, category, egate, info)
 
             # Caption -> just the media/movie name line; None = leave caption as is.
             ok = await _copy_with_retry(
