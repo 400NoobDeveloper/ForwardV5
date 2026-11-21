@@ -122,6 +122,31 @@ Steps for a video file:
      e. Education is only a candidate: a source that knows the show wins over soft course words ("Lessons") and a
         bracketed year; with no confirmation, course signals send the file to education instead of other.
 
+ 14. /autosort only, round 2 (each rule has its own env switch, default on; 0 = the old behaviour; an unexpected
+     exception in a new rule logs one WARNING and falls back to the old behaviour for that file):
+     a. Alternate titles ("Ne Zha A.K.A. Nezha Mo tong jiang shi", "A / B", "A | B", "A (B)") are all candidates, the main
+        title first; release tags ("TRUE", "HQ", "HDRip"), hashtags and place / institution segments are not
+        (TITLE_ALT_SPLIT). "House Mates" / "Housemates" / "WALL-E" / "WALL.E" are one title (TITLE_KEY_MATCH) and the
+        joined / split spellings are extra search queries (TITLE_SPACE_VARIANTS). A 2-word prefix of a longer title
+        ("Blue Eye") is only a candidate when the name has a year that the result agrees with (PREFIX2_NEEDS_YEAR).
+     b. Season packs ("S01", "Season 1", Complete / Batch ...) are a strong series / anime marker (SEASONPACK_AS_MARKER,
+        is_season_pack()); handlers/autosort.py skips the maximum-length check for them.
+     c. AniList entries of ANY country of origin count as anime when the title matches EXACTLY, the year agrees, the
+        format is TV / TV_SHORT / ONA / OVA / MOVIE / SPECIAL and TMDB does not call the title live-action
+        (ANILIST_ANY_ORIGIN; 0 = only JP / CN / KR / TW as before).
+     d. Indian exam-prep / course videos need two independent signals (course words, exam words, subject words,
+        teacher words, a "A | B | C #tag" list) to be education; a source that knows a movie / series wins
+        (EDU_EXAM_RULES).
+     e. The manami anime-offline-database is an offline anime authority when AniList is off or failing, loaded once in
+        the background (USE_ANIME_OFFLINE_DB). The optional "parsett" parser (import PTT) cross-checks the episode
+        number when guessit finds none (USE_PTT_PARSER, default off, needs Python 3.11+).
+     f. A file whose name is truncated ("v .mp4") reads up to CAPTION_LINES_WHEN_NAME_USELESS caption lines.
+     g. One thumbnail gate for all native-video channels (MOVIE_REQUIRE_THUMB, EDUCATION_REQUIRE_THUMB,
+        EDUCATION_THUMB_RATIO_MIN / _MAX / _RATIO_UNKNOWN): see handlers/autosort.py.
+     h. Fail-safe: the helpers of these rules are wrapped by _new_rule() (an exception = one WARNING a minute and the
+        neutral answer = the old behaviour), and a name whose deep parse raises is parsed again with every round-2
+        switch off (_parse_name_safe()). Nothing is ever dropped: a file nothing identifies goes to Other.
+
 Non-video routing (pdf / image / audio / files / other) is extension
 based, exactly as before.
 
@@ -147,7 +172,9 @@ import json
 import math
 import asyncio
 import datetime
+import functools
 import logging
+import time
 import unicodedata
 from collections import OrderedDict
 from difflib import SequenceMatcher
@@ -183,6 +210,61 @@ try:                                    # optional: only used by the deep series
     from rapidfuzz import fuzz as _rf_fuzz
 except ImportError:
     _rf_fuzz = None
+
+
+# ============================================================
+# Round-2 switches (every new /autosort rule has its own env switch; 0 / false / no / off = the OLD behaviour)
+# ============================================================
+def _env_on(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
+
+
+def _env_count(name: str, default: int, lo: int = 0, hi: int = 50) -> int:
+    try:
+        return max(lo, min(hi, int(os.environ.get(name, "").strip() or default)))
+    except ValueError:
+        return default
+
+
+_RULE_WARNED: dict = {}
+
+
+def _new_rule(default):
+    """Decorator for the helpers of the round-2 rules. An unexpected exception inside one of them logs ONE WARNING (per helper,
+    at most once a minute) and the helper answers `default` - the neutral value meaning "this rule says nothing", i.e. the
+    OLD behaviour for that file. `default` is a callable called with the helper's own arguments."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*a, **k):
+            try:
+                return fn(*a, **k)
+            except Exception as e:
+                now = time.monotonic()
+                if now - _RULE_WARNED.get(fn.__name__, -1e9) > 60:
+                    _RULE_WARNED[fn.__name__] = now
+                    logger.warning("autosort: new rule %s failed (%s: %s) - old behaviour for this file",
+                                   fn.__name__, type(e).__name__, e)
+                try:
+                    return default(*a, **k)
+                except Exception:
+                    return None
+        return wrapper
+    return deco
+
+
+TITLE_ALT_SPLIT = _env_on("TITLE_ALT_SPLIT")                   # 3.5  "A.K.A." / " / " / " | " / "(Alt)" alternate titles + junk candidates out
+TITLE_SPACE_VARIANTS = _env_on("TITLE_SPACE_VARIANTS")         # 3.5  joined / split spelling variants in the search queries
+TITLE_KEY_MATCH = _env_on("TITLE_KEY_MATCH")                   # 3.5  "WALL-E" = "WALL·E" = "House Mates" = "Housemates" in the title scorers
+PREFIX2_NEEDS_YEAR = _env_on("PREFIX2_NEEDS_YEAR")             # 3.2  a 2-word prefix of a longer title ("Blue Eye") needs a year that agrees
+SEASONPACK_AS_MARKER = _env_on("SEASONPACK_AS_MARKER")         # 3.4  a season pack ("S01", "Season 1", "Complete") is a strong series / anime marker
+EDU_EXAM_RULES = _env_on("EDU_EXAM_RULES")                     # 3.6  Indian exam-prep / course names: two independent signals = education
+ANILIST_ANY_ORIGIN = _env_on("ANILIST_ANY_ORIGIN")             # 3.2  anime-style Western animation listed by AniList counts as anime
+USE_ANIME_OFFLINE_DB = _env_on("USE_ANIME_OFFLINE_DB")         # 3.7  manami anime-offline-database as an offline anime authority
+USE_PTT_PARSER = _env_on("USE_PTT_PARSER", False)              # 3.7  optional second parser ("parsett", import name PTT); needs Python 3.11+
+CAPTION_LINES_WHEN_NAME_USELESS = _env_count("CAPTION_LINES_WHEN_NAME_USELESS", 6, 2, 12)   # caption lines read when the file name is truncated
 
 CATEGORIES = (
     "anime", "anime_files",
@@ -386,7 +468,68 @@ def _pipe_junk(seg: str) -> bool:
     words = re.findall(r"[^\W_]+", seg or "", re.UNICODE)
     if not words or (len(words) == 1 and _PIPE_CODE_RE.match(words[0])):
         return True
+    if TITLE_ALT_SPLIT and (seg or "").lstrip().startswith("#"):
+        return True                                           # a hashtag ("#pareeksir") is a channel tag, never a title
     return all(w.lower() in _PIPE_JUNK_WORDS or w.isdigit() for w in words)
+
+
+# ---- junk title candidates (deep mode, TITLE_ALT_SPLIT) ------------------------------------------------------------
+# A release / quality tag ("TRUE", "HQ", "HDRip", "TRUE WEB-DL"), a hashtag, or - in a "A | B | C" list - a segment that is
+# only places / institutions / exam names ("Haryana CET Mains & Group D", "Delhi Police", "Railway Special") is never a
+# title. The MAIN title of a name is never removed by these rules; they only prune the EXTRA candidates.
+_RELEASE_JUNK_WORDS = {
+    "true", "hq", "hd", "uhd", "sd", "fhd", "4k", "2k", "hdrip", "webrip", "webdl", "web", "dl", "bluray", "bdrip", "brrip",
+    "dvdrip", "dvdscr", "hdtv", "hdcam", "camrip", "cam", "predvd", "pre", "dvd", "proper", "repack", "remux", "org",
+    "original", "dubbed", "dub", "dual", "multi", "audio", "esub", "esubs", "hsub", "hsubs", "msub", "msubs", "sub", "subs",
+    "hevc", "x264", "x265", "h264", "h265", "avc", "av1", "aac", "ac3", "eac3", "ddp", "dd", "dts", "hdr", "sdr", "10bit",
+    "8bit", "nf", "amzn", "dsnp", "hs", "zee5", "complete", "full", "movie", "film", "line", "extended", "uncut", "unrated",
+    "imax", "remastered", "theatrical", "edition", "version", "rip", "print", "clean", "hindi", "english", "tamil", "telugu",
+    "malayalam", "kannada", "bengali", "punjabi", "marathi", "gujarati", "urdu", "eng", "hin", "tam", "tel", "mal", "kan",
+    "chi", "jpn", "kor", "fre", "ita", "spa", "ger", "rus", "vff", "vf", "vostfr", "multi", "mkv", "mp4", "x", "kbps",
+}
+# Exam / board words (also the education signal "board and exam words", see _edu_signals()).
+_EDU_EXAM_WORDS = {
+    "ncert", "cbse", "icse", "ssc", "cet", "upsc", "neet", "jee", "gate", "railway", "railways", "rrb", "ntpc", "police",
+    "banking", "tet", "ctet", "htet", "uptet", "reet", "ibps", "sbi", "rbi", "nda", "cds", "afcat", "constable", "patwari",
+    "mains", "prelims", "pyq", "ias", "ips", "cuet", "clat", "net", "jrf", "bpsc", "uppsc", "mppsc", "rpsc", "hssc", "hpsc",
+    *[w.strip().lower() for w in os.environ.get("EDU_EXAM_WORDS", "").split(",") if w.strip()],
+}
+_PLACE_INST_WORDS = {
+    "andhra", "assam", "bihar", "goa", "gujarat", "haryana", "himachal", "jharkhand", "karnataka", "kerala", "madhya",
+    "maharashtra", "manipur", "odisha", "orissa", "punjab", "rajasthan", "sikkim", "tamil", "nadu", "telangana", "tripura",
+    "uttar", "pradesh", "uttarakhand", "bengal", "delhi", "mumbai", "kolkata", "chennai", "bangalore", "bengaluru",
+    "hyderabad", "pune", "lucknow", "jaipur", "patna", "bhopal", "nagpur", "india", "indian", "up", "mp", "hp", "jammu",
+    "kashmir", "ladakh", "chandigarh", "army", "navy", "airforce", "defence", "defense", "bank", "board", "commission",
+    "department", "ministry", "court", "judiciary", "teacher", "teaching", "exam", "exams", "examination", "recruitment",
+    "vacancy", "notification", "govt", "government", "sarkari", "job", "jobs", "group", "special", "batch", "live", "gd",
+    "clerk", "po", "si", "forest", "revenue", "state", "central", "national", "all", "and", "for", "the", "of", "in", "a",
+    "b", "c", "d", "e",
+}
+
+
+@_new_rule(lambda *a, **k: [])
+def _title_words(text: str) -> list:
+    return [w.lower() for w in re.findall(r"[^\W_]+", text or "", re.UNICODE)]
+
+
+@_new_rule(lambda *a, **k: False)
+def _only_words(text: str, *sets) -> bool:
+    """Every word of `text` is a digit or belongs to one of the sets (and there is at least one word)."""
+    words = _title_words(text)
+    return bool(words) and all(w.isdigit() or any(w in s for s in sets) for w in words)
+
+
+@_new_rule(lambda *a, **k: False)
+def _extra_title_junk(text: str, pipe_list: bool = True) -> bool:
+    """True for an EXTRA title candidate that is certainly not a title: a hashtag, nothing but release / quality /
+    language tags ("TRUE", "HQ HDRip", "TRUE WEB-DL"), or - with pipe_list - only places / institutions / exam names /
+    lesson-list words ("Concept", "Theory", "Numericals")."""
+    t = (text or "").strip()
+    if not t or t.startswith("#"):
+        return True
+    if _only_words(t, _RELEASE_JUNK_WORDS):
+        return True
+    return bool(pipe_list and _only_words(t, _PLACE_INST_WORDS, _EDU_EXAM_WORDS, _RELEASE_JUNK_WORDS, _EDU_LIST_WORDS))
 
 
 def _pipe_titles_deep(name: str) -> list:
@@ -401,9 +544,14 @@ def _pipe_titles_deep(name: str) -> list:
     ep_idx = next((i for i, s in enumerate(raw) if _EP_SEG_RE.match(s)
                    or re.fullmatch(_DEEP_EP_RE.pattern, s, re.IGNORECASE)), None)
     segs = []
+    # a "Title | A | B | C" list WITHOUT an episode segment (a YouTube lecture / promo name): the segments after the
+    # first that are only places / institutions / exam names ("Delhi Police", "Railway Special") are not titles
+    list_mode = bool(TITLE_ALT_SPLIT and ep_idx is None and len(raw) >= 3)
     for idx, seg in enumerate(raw):
         seg = _EDGE_JUNK_RE.sub("", re.sub(r"\s{2,}", " ", _SEG_NOISE_RE.sub(" ", seg))).strip()
         if idx == ep_idx or len(re.findall(r"\w", seg)) < 2 or _pipe_junk(seg):
+            continue
+        if list_mode and idx > 0 and _extra_title_junk(seg):
             continue
         segs.append((idx, seg[:80]))
     if ep_idx is not None:
@@ -554,8 +702,8 @@ def nsfw_category(message, mapping=None):
     return _nsfw_target(message, mapping)
 
 
-def _candidate_names(message) -> list:
-    """Filename first, then up to two usable caption lines."""
+def _candidate_names(message, max_lines: int = 2) -> list:
+    """Filename first, then up to `max_lines` (default two) usable caption lines."""
     names = []
     fn = get_filename(message)
     if fn:
@@ -571,9 +719,16 @@ def _candidate_names(message) -> list:
             continue
         names.append(line)
         added += 1
-        if added >= 2:
+        if added >= max_lines:
             break
     return names
+
+
+@_new_rule(lambda *a, **k: False)
+def _name_is_useless(filename) -> bool:
+    """A truncated / empty file name ("v .mp4"): fewer than 4 letters or digits before the extension."""
+    stem = os.path.splitext(filename or "")[0]
+    return len(re.findall(r"[^\W_]", stem)) < 4
 
 
 # ============================================================
@@ -1132,14 +1287,16 @@ _STOP_ENDINGS = {"ka", "ki", "ke", "ko", "se", "mein", "me", "hai", "aur", "and"
                  "for", "with", "na", "ek"}
 
 
-def _build_candidates(shape: dict, extra_titles=()) -> list:
+def _build_candidates(shape: dict, extra_titles=(), year=None, alt_titles=()) -> list:
     """Search candidates in priority order, each {"title", "dropped", "kind"}:
       1. the cleaned full title (for a regional franchise with a known language that is the
          language form: "Bigg Boss Kannada"; for Hindi / unknown the plain name comes first)
       2. title + language word
       3. progressive shortening, one word at a time (1 or 2 words, never fewer than one
          word of 5+ letters, never ending on a stop word); each dropped word costs
-         _SHORTEN_PENALTY, so a shortened title only matches when the show name is exact
+         _SHORTEN_PENALTY, so a shortened title only matches when the show name is exact.
+         A 2-word PREFIX of a longer title ("Blue Eye" of "Blue Eye Samurai") is only a candidate when the
+         name has a year (PREFIX2_NEEDS_YEAR), and a result then also has to agree with that year (kind "prefix2")
       4. extra titles (guessit's own idea of the title)
     At most SERIES_MAX_SEARCHES entries, so one show costs at most that many searches per source."""
     limit = max(1, SERIES_MAX_SEARCHES)
@@ -1164,6 +1321,8 @@ def _build_candidates(shape: dict, extra_titles=()) -> list:
         add(clean, 0, "full")
         for t in lang_titles:
             add(t, 0, "full+lang")
+    for t in alt_titles:                                      # "Show A.K.A. Other": every part is a full candidate
+        add(t, 0, "alt")
     words = base.split()
     for drop in (1, 2):
         kept = words[:-drop]
@@ -1171,9 +1330,17 @@ def _build_candidates(shape: dict, extra_titles=()) -> list:
             continue
         if len(kept) == 1 and len(kept[0]) < 5:
             continue
-        add(" ".join(kept), drop, "short")
+        kind = "short"
+        if PREFIX2_NEEDS_YEAR and len(kept) == 2 and len(words) >= 3:
+            if not year:
+                continue                                      # "Blue Eye": no year to agree with = not a candidate
+            kind = "prefix2"
+        add(" ".join(kept), drop, kind)
     for t in extra_titles:
         add(t, 0, "guessit")
+    if TITLE_SPACE_VARIANTS:                                  # "House Mates" -> "Housemates": only while there is room
+        for v in _space_variants(base)[:2]:
+            add(v, 0, "spacevar")
     return out
 
 
@@ -1340,6 +1507,132 @@ def _title_variants(title: str, translit: bool = True) -> list:
     return out
 
 
+# ---- alternate titles, spelling variants and comparison keys (deep mode) -----------------------------------------------
+#   TITLE_ALT_SPLIT       "Ne Zha A.K.A. Nezha Mo tong jiang shi", "Title / Other", "Title | Other", "Title (Other Title)": every
+#                         part is a candidate, the MAIN title (the first part) stays first
+#   TITLE_SPACE_VARIANTS  "House Mates" -> "Housemates", "WALL-E" -> "WALLE", "HouseMates" -> "House Mates" in the search queries
+#   TITLE_KEY_MATCH       the title scorers treat "WALL-E" = "WALL·E" = "walle" and "House Mates" = "Housemates" as the same title
+_ALT_SEP_RE = re.compile(r"(?<![A-Za-z0-9])a[\s._]?k[\s._]?a(?![A-Za-z0-9])|\s[/|｜]\s", re.IGNORECASE)
+_BRACKET_ALT_RE = re.compile(r"[\(\[]([^\(\)\[\]]{3,80})[\)\]]")
+_EDITION_WORDS = {"cut", "edition", "version", "remastered", "extended", "uncut", "unrated", "imax", "director", "directors",
+                  "theatrical", "final", "collectors", "anniversary", "restored", "season", "seasons", "episodes", "batch"}
+
+
+@_new_rule(lambda title: [title] if title else [])
+def _split_alt_titles(title: str) -> list:
+    """"Ne Zha A K A Nezha Mo tong jiang shi" -> ["Ne Zha", "Nezha Mo tong jiang shi"]. Splits on A.K.A. / AKA / aka, " / "
+    and " | ". The first part is the main title; a part with fewer than two letters is dropped; a name whose first part
+    would be empty is not split. Never raises; always at least [title] for a non-empty title."""
+    t = re.sub(r"\s{2,}", " ", title or "").strip()
+    if not t:
+        return []
+    try:
+        pieces = [re.sub(r"^[\s\-–—_:|~.,/]+|[\s\-–—_:|~.,/]+$", "", x) for x in _ALT_SEP_RE.split(t)]
+        if len(pieces) < 2 or len(re.findall(r"[^\W_]", pieces[0])) < 2:
+            return [t]
+        # a hashtag and whatever follows it is a channel tag / download tail ("Railway Special |#pareeksir 360p"), never title text
+        pieces = [pieces[0]] + [re.sub(r"\s*[|｜]?\s*#\S.*$", "", x).strip() for x in pieces[1:]]
+        # "A | B | C" with three or more parts is a LIST (a YouTube lecture / promo name): a later part that is only places /
+        # institutions / exam names ("Delhi Police", "Haryana CET Mains & Group D") or release tags is not a title. The
+        # main (first) part is never removed here.
+        list_mode = len(pieces) >= 3 and bool(re.search(r"[|｜]", t))
+        out, keys = [], set()
+        for i, x in enumerate(pieces):
+            k = _norm_cmp(x)
+            if len(re.findall(r"[^\W_]", x)) >= 2 and k and k not in keys:
+                if i > 0 and list_mode and _extra_title_junk(x, pipe_list=True):
+                    continue
+                keys.add(k)
+                out.append(x)
+        return out or [t]
+    except Exception as e:
+        logger.debug("alternate-title split failed on %r: %s", title, e)
+        return [t]
+
+
+@_new_rule(lambda text: (text, []))
+def _pull_bracket_alts(text: str):
+    """(text with the alternate-title brackets removed, [alternate titles]). "Spirited Away (Sen to Chihiro) 2001": a
+    bracket group counts as an alternate title only when it sits INSIDE the title part of the name (after some title
+    text, before the year / technical tail), has two or more words and is not a year, a release / language / audio tag,
+    an edition ("Director's Cut"), a season / batch word or a release group. Never raises."""
+    try:
+        tech = _TECH_START_RE.search(text)
+        limit = tech.start() if tech else len(text)
+        alts = []
+
+        def repl(m):
+            inner = re.sub(r"\s{2,}", " ", _spaced(m.group(1))).strip()
+            toks = [t for t in inner.split() if re.search(r"[^\W_]", t)]
+            if (m.start() < 2 or m.start() >= limit or len(toks) < 2 or len(toks) > 8
+                    or not re.match(r"[^\W\d_]", inner) or len(re.findall(r"[^\W_]", inner)) < 3):
+                return m.group(0)
+            if any(_movie_tok(t) in ("strong", "year") for t in toks):
+                return m.group(0)
+            if all(_movie_tok(t) == "weak" or re.sub(r"[^a-z0-9]", "", t.lower()) in _MOVIE_TAGS_NORM for t in toks):
+                return m.group(0)
+            if {w for w in _title_words(inner)} & _EDITION_WORDS or _generic_title(inner):
+                return m.group(0)
+            if _extra_title_junk(inner, pipe_list=False) or _only_words(inner, _PLACE_INST_WORDS, _EDU_EXAM_WORDS):
+                return m.group(0)
+            alts.append(inner)
+            return " "
+
+        new = _BRACKET_ALT_RE.sub(repl, text)
+        return (new, alts) if alts else (text, [])
+    except Exception as e:
+        logger.debug("bracket alternate-title scan failed on %r: %s", text, e)
+        return text, []
+
+
+@_new_rule(lambda words: "".join(words))
+def _join_words(words: list) -> str:
+    return words[0] + "".join(w.lower() for w in words[1:])
+
+
+@_new_rule(lambda *a, **k: [])
+def _space_variants(title: str) -> list:
+    """Spelling variants that differ only in spaces / hyphens / dots, never the title itself, most likely first:
+      "House Mates" -> "Housemates", "Ne Zha" -> "Nezha"   (two plain words joined)
+      "WALL-E"      -> "WALLE"                                 (a hyphen / middle dot between letters removed)
+      "HouseMates"  -> "House Mates", "Kalki2898" -> "Kalki 2898"   (a glued compound split)
+    Used as extra TMDB / IMDb / AniList queries only; a result still has to match the title by the scorers."""
+    out, seen = [], {_norm_cmp(title or "")}
+
+    def add(t):
+        t = re.sub(r"\s{2,}", " ", t or "").strip()
+        k = _norm_cmp(t)
+        if k and k not in seen and len(re.findall(r"[^\W_]", t)) >= 2:
+            seen.add(k)
+            out.append(t)
+
+    try:
+        words = (title or "").split()
+        add(re.sub(r"(?<=[^\W\d_])[-·‐‑–]+(?=[^\W\d_])", "", title or ""))
+        if len(words) == 2 and all(re.fullmatch(r"[^\W_]+", w) for w in words):
+            add(_join_words(words))                           # (3-word joins stay in _title_variants())
+        add(re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])", " ", title or ""))
+    except Exception as e:
+        logger.debug("space variants failed on %r: %s", title, e)
+    return out
+
+
+@_new_rule(lambda *a, **k: "")
+def _title_key(text: str) -> str:
+    """Comparison key of a title: lower case, accents folded, punctuation / middle dots and spaces removed
+    ("WALL-E" = "WALL·E" = "walle", "House Mates" = "Housemates")."""
+    return _norm_cmp(text or "").replace(" ", "")
+
+
+@_new_rule(lambda *a, **k: False)
+def _keys_equal(a: str, b: str) -> bool:
+    """TITLE_KEY_MATCH: two already-normalised titles are one title when their keys agree (min 3 characters)."""
+    if not TITLE_KEY_MATCH:
+        return False
+    ka, kb = _title_key(a), _title_key(b)
+    return len(ka) >= 3 and ka == kb
+
+
 def _movie_info(raw: str) -> dict:
     """Pure clean-up of one release name for deep MOVIE identification (no network, never raises).
       title        the cut-out title ("M S M", "2012", "Kalaratri")        year   release year or None
@@ -1353,7 +1646,7 @@ def _movie_info(raw: str) -> dict:
       usable       there is something to search for (a digits-only title needs its year)"""
     out = {"title": "", "titles": [], "year": None, "year_in_brackets": False, "digits": False, "initials": False,
            "languages": [], "indian": False, "tags": [], "handle": None, "tech": False, "variants": [],
-           "usable": False}
+           "usable": False, "alt": []}
     try:
         stem = _VIDEO_EXT_END_RE.sub("", raw or "").strip()
         if not stem:
@@ -1374,6 +1667,9 @@ def _movie_info(raw: str) -> dict:
             return f" {mm.group(1)} "
 
         text = _MOVIE_BRACKET_YEAR_RE.sub(_by, text)
+        bracket_alts = []
+        if TITLE_ALT_SPLIT:
+            text, bracket_alts = _pull_bracket_alts(text)         # "Title (Other Title) 2001": the bracket is an alternate title
         text = re.sub(r"[\[\]\(\)【】「」{}]", " ", text)
         # _spaced() keeps the dot between two digits ("5.1"); "2016.1080p" / "x265.10bit" are two tokens
         text = re.sub(r"(?<=\d{3})\.(?=\d)|(?<=\d)\.(?=\d{3})", " ", text)
@@ -1400,7 +1696,16 @@ def _movie_info(raw: str) -> dict:
                                        or re.sub(r"[^a-z0-9]", "", title_toks[-1].lower()) in _MOVIE_TAGS_NORM):
             title_toks.pop()                                  # a trailing "-" or release-group tag
         title = re.sub(r"^[\s\-–—_:|~.,]+|[\s\-–—_:|~.,]+$", "", " ".join(title_toks))
+        alt_titles = []
+        if TITLE_ALT_SPLIT and title:
+            parts = _split_alt_titles(title)                      # "Ne Zha A K A Nezha Mo tong jiang shi": main first
+            if len(parts) > 1:
+                title, alt_titles = parts[0], parts[1:]
+            for b in bracket_alts:
+                if _norm_cmp(b) not in {_norm_cmp(x) for x in [title, *alt_titles]}:
+                    alt_titles.append(b)
         out["title"] = title
+        out["alt"] = alt_titles
 
         langs, tags = [], []
         for tok in toks[cut:]:
@@ -1424,10 +1729,20 @@ def _movie_info(raw: str) -> dict:
         if out["initials"]:
             letters = [w.rstrip(".") for w in words]
             titles += ["".join(letters), ".".join(letters)]  # "MSM", "M.S.M"
+        if alt_titles:
+            # a name that spells its title in several ways: the main title, its joined spelling ("Ne Zha" -> "Nezha"),
+            # then every alternate title ("Nezha Mo tong jiang shi")
+            if TITLE_SPACE_VARIANTS:
+                titles += _space_variants(title)[:1]
+            titles += alt_titles
         out["titles"] = list(dict.fromkeys(t for t in titles if t))
         out["usable"] = bool(len(re.findall(r"[^\W_]", title)) >= 2 and (not out["digits"] or out["year"]))
         if out["usable"] and out["year"] and not out["digits"]:
-            out["variants"] = _title_variants(title, translit=bool(out["indian"] or _TRANSLIT_HINT_RE.search(title)))
+            variants = _title_variants(title, translit=bool(out["indian"] or _TRANSLIT_HINT_RE.search(title)))
+            if TITLE_SPACE_VARIANTS:                              # "House Mates" -> "Housemates" first, then the old variants
+                sv = _space_variants(title)
+                variants = sv + [v for v in variants if _norm_cmp(v) not in {_norm_cmp(x) for x in sv}]
+            out["variants"] = variants
     except Exception as e:                                    # never raise from an identification layer
         logger.debug("movie name clean-up failed on %r: %s", raw, e)
         out["usable"] = False
@@ -1453,9 +1768,11 @@ def _movie_attach(p: dict, mv: dict) -> None:
     for t in p["titles"]:
         k = _norm_cmp(t)
         if k and k not in seen and not _generic_title(t):
+            if TITLE_ALT_SPLIT and _extra_title_junk(t, pipe_list=False):
+                continue                                      # "TRUE", "HQ", "HDRip", "#hashtag": a tag, never a title
             seen.add(k)
             titles.append(t)
-    p["titles"] = titles[:4]
+    p["titles"] = titles[:(6 if TITLE_ALT_SPLIT and mv.get("alt") else 4)]
     p["candidates"] = [{"title": t, "dropped": 0, "kind": "movie"} for t in p["titles"]]
     p["clean_title"] = mv["title"]
     if mv["year"] and (p["year"] is None or mv["year_in_brackets"]):
@@ -1465,6 +1782,97 @@ def _movie_attach(p: dict, mv: dict) -> None:
         p["has_movie_signal"] = True
     p["year_required"] = bool(mv["digits"])
     p["movie"] = mv
+
+
+# ---- season packs (deep mode, SEASONPACK_AS_MARKER) --------------------------------------------------------------------
+# A season pack is ONE file holding a whole season: a season number with NO episode number ("S01", "Season 1") or a batch
+# word. "Batch", "Full Season" and "All Episodes" are enough alone; "Complete", "Combined", "Entire", "Whole" count only
+# together with a season number or an anime tag (a film called "The Complete Guide" is no pack). A pack is a strong
+# series / anime marker (like S01E02) and its length is not limited by SERIES_MAX_MINUTES / ANIME_MAX_MINUTES
+# (SEASONPACK_SKIP_MAX_DURATION); the minimum length, thumbnail and ratio rules still apply.
+_BATCH_ALONE_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:batch|full[\s._-]*seasons?|all[\s._-]*(?:episodes?|eps))(?![A-Za-z0-9])", re.IGNORECASE)
+_BATCH_SEASONLESS_RE = re.compile(r"(?<![A-Za-z0-9])(?:complete|combined|entire|whole)(?![A-Za-z0-9])", re.IGNORECASE)
+
+
+@_new_rule(lambda *a, **k: False)
+def _detect_pack(name: str, g: dict, pre: dict, prep: dict, anime_like: bool) -> bool:
+    """True when the (deep-cleaned) name is a season pack, see the block comment above. Pure string work."""
+    if pre.get("pack"):
+        return True                                           # "S01 Combined": the old, narrower rule
+    if prep.get("date") is not None or pre.get("ep_of"):
+        return False
+    probe = _BATCH_ALONE_RE.sub(" ", name)                    # "All Episodes 1080p" must not read as "Episodes 1080"
+    if _EP_MARKER_RE.search(probe) or _DEEP_EP_RE.search(probe):
+        return False
+    if _episode_numbers(name, g)[1] is not None:
+        return False
+    if _SEASON_RE.search(name) or _BATCH_ALONE_RE.search(name):
+        return True
+    return bool(anime_like and _BATCH_SEASONLESS_RE.search(name))
+
+
+@_new_rule(lambda *a, **k: False)
+def is_season_pack(parsed) -> bool:
+    """True when a parsed name (the dict of _parse_name(), or a list of them) is a season pack: a season number with no
+    episode number ("S01", "Season 1") or a batch word (Complete, Combined, Batch, Full Season, All Episodes). Used by
+    /autosort's gates: the maximum-length check is skipped for a pack. Never raises."""
+    try:
+        items = parsed if isinstance(parsed, (list, tuple)) else [parsed]
+        return any(bool(pp and (pp.get("pack") or pp.get("season_pack"))) for pp in items)
+    except Exception:
+        return False
+
+
+_PTT = None
+
+
+@_new_rule(lambda *a, **k: (None, None))
+def _ptt_episode(name: str):
+    """(season, episode) from the optional "parsett" package (import name PTT), else (None, None). Only used with
+    USE_PTT_PARSER=1; the package needs Python 3.11+ - on an older interpreter the import fails once and this stays off."""
+    global _PTT
+    if _PTT is None:
+        try:
+            import PTT as _mod                                # type: ignore
+            _PTT = _mod
+        except Exception as e:
+            logger.warning("USE_PTT_PARSER is on but the parsett package (import PTT) is unavailable: %s", e)
+            _PTT = False
+    if not _PTT:
+        return None, None
+    try:
+        r = _PTT.parse_title(name) or {}
+        seasons, episodes = r.get("seasons") or [], r.get("episodes") or []
+        return (_as_int(seasons[0]) if seasons else None), (_as_int(episodes[0]) if episodes else None)
+    except Exception as e:
+        logger.debug("parsett failed on %r: %s", name, e)
+        return None, None
+
+
+_ROUND2_SWITCHES = ("TITLE_ALT_SPLIT", "TITLE_SPACE_VARIANTS", "TITLE_KEY_MATCH", "PREFIX2_NEEDS_YEAR", "SEASONPACK_AS_MARKER",
+                    "EDU_EXAM_RULES", "USE_PTT_PARSER")
+
+
+def _parse_name_safe(raw: str, check_extra: bool = False, deep: bool = False, anime: bool = False):
+    """_parse_name() for classify_async(). The deep parse has new rules (alternate titles, joined variants, key match, season
+    packs ...). If one of them raises on a name, ONE WARNING is logged and that name is parsed again with every round-2
+    switch off (this function is synchronous, so the switches cannot change under another task) = the OLD behaviour.
+    A name the old code cannot parse either raises exactly as it did before."""
+    try:
+        return _parse_name(raw, check_extra=check_extra, deep=deep, anime=anime)
+    except Exception as e:
+        if not deep:
+            raise
+        logger.warning("autosort: the new name rules failed on %r (%s: %s) - parsing it the old way", raw, type(e).__name__, e)
+        g = globals()
+        saved = {k: g[k] for k in _ROUND2_SWITCHES}
+        try:
+            for k in saved:
+                g[k] = False
+            return _parse_name(raw, check_extra=check_extra, deep=deep, anime=anime)
+        finally:
+            g.update(saved)
 
 
 def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: bool = False):
@@ -1546,6 +1954,27 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: 
         strong_episode = strong_episode or bool(_DEEP_EP_RE.search(name)) or prep["date"] is not None
         strong_episode = strong_episode or bool(pre.get("pack"))        # "S01 Combined" is explicit series naming
 
+    if USE_PTT_PARSER and prep and strong_episode and not _as_int(g.get("episode")):
+        # optional second parser (parsett / PTT): only when guessit found no episode on a name with an obvious marker
+        ptt_s, ptt_e = _ptt_episode(name)
+        if ptt_e:
+            g = dict(g)
+            g["episode"] = ptt_e
+            if ptt_s and not _as_int(g.get("season")):
+                g["season"] = ptt_s
+
+    # deep: a SEASON PACK ("S01", "Season 1", "Complete", "Batch" ... with no episode number, see is_season_pack()) is
+    # explicit series / anime naming, a strong marker like "S01E02"
+    pack = False
+    if prep and SEASONPACK_AS_MARKER:
+        try:
+            pack = _detect_pack(name, g, pre, prep, bool(anime_title) or bool(_fansub_group(name)))
+        except Exception as e:                                            # never raise: fall back to the old rule
+            logger.warning("season-pack check failed on %r: %s - old behaviour", raw, e)
+            pack = False
+        if pack:
+            strong_episode = True
+
     guess_titles = []
     for t in (anime_title, g.get("title"), g.get("alternative_title")):
         for item in (t if isinstance(t, (list, tuple)) else [t]):
@@ -1561,8 +1990,18 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: 
         # deep: the show / episode title / language come from the name's own structure;
         # guessit's title is only an extra fallback candidate
         shape = _derive_shape(name) or None
+        alt_extra = []
+        if shape and TITLE_ALT_SPLIT:
+            try:                                          # "Show A.K.A. Other Title S01E01": every part is a candidate
+                parts = _split_alt_titles(shape["base"])
+                if len(parts) > 1 and shape["clean_title"] == shape["base"]:
+                    shape = dict(shape, base=parts[0], clean_title=parts[0])
+                    alt_extra = parts[1:]
+            except Exception as e:
+                logger.warning("alternate-title split failed on %r: %s - old behaviour", raw, e)
         if shape:
-            cands = _build_candidates(shape, guess_titles)
+            cands_year = None if (prep["date"] is not None) else (_as_int(g.get("year")) or (mv or {}).get("year"))
+            cands = _build_candidates(shape, guess_titles, cands_year, alt_extra)
             titles = [c["title"] for c in cands]
             max_titles = max(1, SERIES_MAX_SEARCHES)
     if not titles and _PIPE_RE.search(name):
@@ -1576,6 +2015,9 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: 
         # deep: "Episode" / "Part" / "Video" / a bare language, a single letter or number and
         # bare platform names are not titles
         titles = [t for t in titles if not _generic_title(t) and t.lower() not in prep["platforms"]]
+        if TITLE_ALT_SPLIT and len(titles) > 1:
+            # release / quality tags ("TRUE", "HQ", "HDRip") and hashtags are never extra titles; the main one always stays
+            titles = titles[:1] + [t for t in titles[1:] if not _extra_title_junk(t, pipe_list=False)]
     if not titles and mv and mv["usable"] and mv["digits"]:
         titles = [mv["title"]]                    # "2012 (2009)": a number-only title is allowed (its year must agree)
     titles = titles[:max_titles]
@@ -1592,6 +2034,9 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: 
     # or channel-tagged episode (\"Ghar Ki Baat 12 Nov 2026\", \"Star Plus\") is a TV serial.
     serial_style = bool(prep and (prep["date"] or prep["platforms"] or pre.get("serial")))
     season_no, episode_no = _episode_numbers(name, g) if prep else (None, None)
+    if pack and season_no is None:                            # a bare "S01" (guessit may not report it)
+        m_s = re.search(r"(?<![A-Za-z0-9])s0*(\d{1,2})(?![A-Za-z0-9])", name, re.IGNORECASE)
+        season_no = int(m_s.group(1)) if m_s else None
     anime_hint = bool(anime_title) or (bool(is_episode) and not (g.get("season") or season_no) and not serial_style)
     release_group = bool(g.get("release_group")) or bool(norm and norm["group_removed"])
     weak = (not (any(g.get(f) for f in _RELEASE_SIGNAL_FIELDS) or release_group) and not anime_title
@@ -1610,7 +2055,7 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: 
     part_weak = bool(prep and _PART_RE.search(name) and not (g.get("year") or release_group))
     signals = []
     if strong_episode:
-        signals.append("date" if date_ep else ("pack" if pre.get("pack") else "marker"))
+        signals.append("date" if date_ep else ("pack" if (pre.get("pack") or pack) else "marker"))
     if pre.get("tv_source"):
         signals.append("tv-source")
     if pre.get("broadcaster"):
@@ -1644,6 +2089,8 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: 
         "series_like": bool(strong_episode or _SEASON_RE.search(name)),
         # deep-only: a season pack ("S01 Combined"), a TV-source rip (PDTV / HDTV ...), "not anime-style naming"
         "season_pack": bool(pre.get("pack")),
+        # deep-only: the broader season-pack test (a season number or batch word and NO episode number, is_season_pack())
+        "pack": bool(pack or pre.get("pack")),
         "tv_source": bool(pre.get("tv_source")),
         "serial_style": serial_style,
         # deep-only (neutral defaults otherwise)
@@ -1698,13 +2145,16 @@ def _early_category(message, archives_as_files: bool = False):
         return "image", [], False
 
     filename = get_filename(message)
+    # deep (/autosort) only: a missing / truncated file name ("v .mp4") makes EVERY caption line a candidate
+    # (up to CAPTION_LINES_WHEN_NAME_USELESS); a normal file name keeps the old two lines.
+    wide = CAPTION_LINES_WHEN_NAME_USELESS if (archives_as_files and _name_is_useless(filename)) else 2
     if not filename:
         if getattr(message, "voice", None) or getattr(message, "audio", None):
             return "audio", [], False
         # Native video uploads often have no file_name; the title is
         # usually in the caption.
         if getattr(message, "video", None) is not None:
-            names = _candidate_names(message)
+            names = _candidate_names(message, wide)
             if names:
                 return None, names, False
         return "other", [], False
@@ -1729,7 +2179,7 @@ def _early_category(message, archives_as_files: bool = False):
     # A video-extension file: "_files" variant only if it arrived as a
     # genuine document upload (see /diagnose_media).
     is_files_variant = getattr(message, "document", None) is not None
-    return None, _candidate_names(message), is_files_variant
+    return None, _candidate_names(message, wide), is_files_variant
 
 
 def _other_note(info, reason: str, detail: str = "") -> None:
@@ -2508,6 +2958,13 @@ async def _tmdb_identify(session, tmdb_key: str, p: dict, use_anilist: bool = Fa
                                ",".join(ident.match.get("origin_country") or []), ident.anime_source,
                                ident.anime_why, ident.animelist)
     if not use_anilist:
+        if anime_mode and USE_ANIME_OFFLINE_DB and (status != "found" or (kind in ("series", "movie") and animated)):
+            # AniList is OFF and TMDB is unsure: the anime-offline-database may know it (exact title + year, never raises)
+            res = await _anime_lookup(session, p, anilist_key, False)
+            if res["status"] == "found":
+                _anime_note(info, anilist="off", source=res["source"], verdict="anime",
+                            **_anime_media_fields(res["media"], res["source"]))
+                return "found", "anime"
         return status, kind
     if status == "found" and not (kind in ("series", "movie") and animated):
         return status, kind           # anime already, or a live-action movie/series
@@ -2878,7 +3335,7 @@ async def classify_async(message, session=None, tmdb_key: str = "", use_anilist:
         # the first caption line) is checked for sample / trailer / teaser ...
         # Before this was skipped when there was no file name, so a caption-only
         # "Movie (2025) Official Trailer" was matched to the movie on TMDB.
-        p = _parse_name(raw, check_extra=(i == 0), deep=deep_series, anime=anime_mode)
+        p = _parse_name_safe(raw, check_extra=(i == 0), deep=deep_series, anime=anime_mode)
         if p:
             parsed.append(p)
     if not parsed:
@@ -3165,6 +3622,33 @@ if SERIES_RATIO_UNKNOWN not in ("other", "allow"):
 # A video / document without any thumbnail is not a proper series episode: "other".
 SERIES_REQUIRE_THUMB = os.environ.get("SERIES_REQUIRE_THUMB", "1").strip().lower() not in ("0", "false", "no")
 
+# ---- ONE thumbnail gate for ALL native-video channels (handlers/autosort.py) --------------------------------------------
+# A native video (message.video) sent to Movies / Series / Anime / Education needs a REAL thumbnail of a landscape shape;
+# the video's own width / height never rescues a missing thumbnail. First failure wins, the result is "other" (reason
+# no_thumb / ratio). Documents ("*_files" channels) are never gated.
+#   MOVIE_REQUIRE_THUMB=1       Movies:    a video with NO thumbnail goes to Other (the ratio band is MOVIE_THUMB_RATIO_*)
+#   EDUCATION_REQUIRE_THUMB=1   Education: the same for the education channel (video only, no duration limits)
+#   EDUCATION_THUMB_GATE=1      master switch of the education gate (0 = education videos are not gated at all)
+#   EDUCATION_THUMB_RATIO_MIN / _MAX  thumbnail band of the education gate, default 1.30 .. 2.40
+#   EDUCATION_RATIO_UNKNOWN=other     "other" | "allow": no thumbnail size at all
+#   SEASONPACK_SKIP_MAX_DURATION=1    a season pack skips SERIES_MAX_MINUTES / ANIME_MAX_MINUTES (minimum, thumbnail and
+#                                     ratio rules still apply)
+MOVIE_REQUIRE_THUMB = _env_on("MOVIE_REQUIRE_THUMB")
+EDUCATION_REQUIRE_THUMB = _env_on("EDUCATION_REQUIRE_THUMB")
+EDUCATION_THUMB_GATE = _env_on("EDUCATION_THUMB_GATE")
+SEASONPACK_SKIP_MAX_DURATION = _env_on("SEASONPACK_SKIP_MAX_DURATION")
+
+EDUCATION_THUMB_RATIO_MIN = _env_float("EDUCATION_THUMB_RATIO_MIN", _DEFAULT_THUMB_RATIO_MIN)
+EDUCATION_THUMB_RATIO_MAX = _env_float("EDUCATION_THUMB_RATIO_MAX", _DEFAULT_THUMB_RATIO_MAX)
+if not 0 < EDUCATION_THUMB_RATIO_MIN < EDUCATION_THUMB_RATIO_MAX:
+    logger.warning("EDUCATION_THUMB_RATIO_MIN/MAX (%s / %s) are not a valid range - using %s / %s",
+                   EDUCATION_THUMB_RATIO_MIN, EDUCATION_THUMB_RATIO_MAX, _DEFAULT_THUMB_RATIO_MIN, _DEFAULT_THUMB_RATIO_MAX)
+    EDUCATION_THUMB_RATIO_MIN, EDUCATION_THUMB_RATIO_MAX = _DEFAULT_THUMB_RATIO_MIN, _DEFAULT_THUMB_RATIO_MAX
+
+EDUCATION_RATIO_UNKNOWN = os.environ.get("EDUCATION_RATIO_UNKNOWN", "other").strip().lower()
+if EDUCATION_RATIO_UNKNOWN not in ("other", "allow"):
+    EDUCATION_RATIO_UNKNOWN = "other"
+
 # Score weights (_score_series). A guessit-only "episode" verdict (no explicit marker)
 # counts half a marker: guessit also reads bare numbers ("Show 105") that way.
 # "Part N" is never an episode marker (film sequels use it).
@@ -3205,6 +3689,8 @@ def _title_score_deep(query: str, cand: str) -> float:
         return 1.0
     if _DIGITS.findall(query) != _DIGITS.findall(cand):
         return 0.0
+    if _keys_equal(query, cand):
+        return 1.0                                            # "wall e" = "walle", "house mates" = "housemates"
     return max(_sim(query, cand), _sim(_collapse(query), _collapse(cand)))
 
 
@@ -3630,6 +4116,7 @@ def _tv_rank(results, cand: dict, p: dict) -> list:
     need_raw = 1.0 if weak else MIN_TITLE_SCORE
     min_votes = EPISODE_MIN_VOTES if p.get("strong_episode") else STRICT_MIN_VOTES
     penalty = cand.get("dropped", 0) * _SHORTEN_PENALTY
+    prefix2 = bool(PREFIX2_NEEDS_YEAR and cand.get("kind") == "prefix2")
     rows = []
     for r in (results or [])[:10]:
         raw = max((_title_score_deep(q, _norm_cmp(n)) for n in (r.get("name"), r.get("original_name")) if n),
@@ -3639,6 +4126,11 @@ def _tv_rank(results, cand: dict, p: dict) -> list:
             continue
         if weak and (r.get("vote_count") or 0) < min_votes:
             continue
+        if prefix2:
+            # a 2-word PREFIX of a longer title ("Blue Eye" of "Blue Eye Samurai") only counts when the file's year agrees
+            ry, fy = _year_of(r.get("first_air_date")), p.get("year")
+            if not (fy and ry and abs(ry - fy) <= 1):
+                continue
         rows.append((r, eff, raw))
     return rows
 
@@ -3796,6 +4288,14 @@ async def _deep_tmdb_tv(session, tmdb_key: str, p: dict, use_anilist: bool, anil
                 session, {"titles": titles, "year": p.get("year"), "weak": p.get("weak", False)}, anilist_key)
             if a_status == "found":
                 status, kind, why = "found", "anime", "anilist match"
+    elif (not use_anilist and anime_mode and USE_ANIME_OFFLINE_DB
+          and (status != "found" or (kind == "series" and ent.get("animated")))):
+        # AniList is OFF and TMDB is unsure: the anime-offline-database may know it (exact title + year, never raises)
+        res = await _anime_lookup(session, p, anilist_key, False)
+        if res["status"] == "found":
+            status, kind, why = "found", "anime", f"{res['source']} match"
+            _anime_note(info, anilist="off", source=res["source"], verdict="anime",
+                        **_anime_media_fields(res["media"], res["source"]))
     return {"status": status, "kind": kind, "entry": ent, "why": why}
 
 
@@ -3838,6 +4338,10 @@ def _tvmaze_pick(results, cand: dict, p: dict):
             sy = _year_of(show.get("premiered"))
             ey = _year_of(show.get("ended")) or (datetime.date.today().year + 1)
             if sy and (year < sy - 1 or year > ey + 1):
+                continue
+        if PREFIX2_NEEDS_YEAR and cand.get("kind") == "prefix2":
+            sy = _year_of(show.get("premiered"))
+            if not (year and sy and abs(year - sy) <= 1):     # a 2-word prefix needs the year to agree
                 continue
         key = (round(eff, 2), 1 if lang and _lang_code_of(show.get("language")) == lang else 0, show.get("weight") or 0)
         if best is None or key > best_key:
@@ -3935,6 +4439,8 @@ async def _wikidata_facts_for(session, p: dict):
     if entry is None:
         errored = False
         for cand in _cands_of(p)[:SERIES_MAX_SEARCHES]:
+            if cand.get("kind") in ("prefix2", "spacevar"):
+                continue                                      # Wikidata has no year rule for these weaker candidates
             e = await _wikidata_lookup(session, cand, p)
             if e is None:
                 errored = True
@@ -4643,9 +5149,69 @@ _EDU_COURSE_RE = re.compile(
 )
 
 
+# Indian exam-prep / course videos (EDU_EXAM_RULES): SOFT signals of five independent classes. A file needs TWO different
+# classes to be a soft education candidate - a single word ("Police", "Sir", "Science") never is one:
+#   course   revision / marathon / PYQ / mock test / demo / one shot / crash course / full course / complete syllabus
+#            (and every STRONG course word of _EDU_COURSE_RE: lecture, tutorial, class 5, chapter 2 ...)
+#   exam     board / exam words (NCERT, CBSE, ICSE, SSC, CET, UPSC, NEET, JEE, GATE, railway, group d, police, banking, TET ...)
+#   subject  physics, chemistry, biology, maths, science, polity, history, geography, reasoning, english grammar ...
+#   teacher  "by X Sir", "Mam", "Sir"
+#   list     a YouTube list "A | B | C" with a hashtag, or "Concept | Theory | Numericals"
+# A name with a bracketed year, a release tag (WEB-DL, BluRay, HDRip, x264 ...) or an episode marker is a release, not a
+# course. The result is only SOFT: any source that knows a movie / series by the cleaned title (TMDB, TVmaze, IMDb,
+# Wikidata, AniList) wins over it (see _deep_series()).
+_EDU_RELEASE_GUARD_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:web[\s._-]?(?:dl|rip)|blu[\s._-]?ray|br[\s._-]?rip|bd[\s._-]?rip|hd[\s._-]?rip|hdtv|dvd[\s._-]?rip|"
+    r"x26[45]|h[\s.]?26[45]|hevc|10bit|dd[p+]?[\s._]?\d)(?![A-Za-z0-9])", re.IGNORECASE)
+_EDU_SOFT_COURSE_RE = re.compile(
+    r"(?<![a-z])(?:revision|revise|marathon|pyqs?|previous year|mock test|test series|demo class|demo|one shot|oneshot|"
+    r"crash course|full course|full syllabus|complete syllabus|doubt session|doubt class)(?![a-z])")
+_EDU_SUBJECT_RE = re.compile(
+    r"(?<![a-z])(?:physics|chemistry|biology|maths?|mathematics|science|polity|history|geography|reasoning|economics|"
+    r"english grammar|current affairs)(?![a-z])")
+_EDU_TEACHER_RE = re.compile(r"(?<![a-z])(?:sir|mam|maam|madam|ma am)(?![a-z])")
+_EDU_GROUP_D_RE = re.compile(r"(?<![a-z])group[\s]*d(?![a-z])")
+_EDU_LIST_WORDS = {"concept", "concepts", "theory", "numericals", "numerical", "questions", "pyq", "pyqs", "tricks",
+                   "shortcuts", "formulas", "formula", "notes", "revision", "practice", "mcq", "mcqs"}
+
+
+@_new_rule(lambda *a, **k: set())
+def _edu_signals(names, show_names=()) -> set:
+    """The independent classes of SOFT education signals found in the names (see the block comment above). Empty when
+    EDU_EXAM_RULES is off. Words of the matched show's own title never count. Never raises."""
+    found = set()
+    if not EDU_EXAM_RULES:
+        return found
+    try:
+        shows = [_norm_cmp(s) for s in show_names if s and s.strip()]
+        for raw in names:
+            text = raw or ""
+            if _MOVIE_BRACKET_YEAR_RE.search(text) or _EDU_RELEASE_GUARD_RE.search(text) or _DEEP_EP_RE.search(text):
+                continue
+            rest = _norm_cmp(re.sub(r"[._]", " ", _VIDEO_EXT_TAIL_RE.sub("", text)))
+            for s in shows:
+                if s:
+                    rest = rest.replace(s, " ")
+            if _EDU_SOFT_COURSE_RE.search(rest) or _EDU_COURSE_RE.search(rest):
+                found.add("course")
+            if set(rest.split()) & _EDU_EXAM_WORDS or _EDU_GROUP_D_RE.search(rest):
+                found.add("exam")
+            if _EDU_SUBJECT_RE.search(rest):
+                found.add("subject")
+            if _EDU_TEACHER_RE.search(rest):
+                found.add("teacher")
+            segs = [s.strip() for s in re.split(r"\s*[|｜]\s*", text) if s.strip()]
+            if (len(segs) >= 3 and "#" in text) or sum(1 for s in segs if _only_words(s, _EDU_LIST_WORDS)) >= 2:
+                found.add("list")
+    except Exception as e:
+        logger.debug("education signals failed on %r: %s", names, e)
+    return found
+
+
 def _edu_level(names, show_names=()) -> int:
-    """0 = no course naming, 1 = SOFT (only generic words: "Lessons", "Classroom", "Chapter"), 2 = STRONG (a numbered
-    lecture "5.1.3 Intro to Python", a course / lecture / tutorial / bootcamp / platform word, "class 5").
+    """0 = no course naming, 1 = SOFT (only generic words: "Lessons", "Classroom", "Chapter" - or two independent
+    exam-prep signals, see _edu_signals()), 2 = STRONG (a numbered lecture "5.1.3 Intro to Python", a course / lecture /
+    tutorial / bootcamp / platform word, "class 5").
     Words that belong to the matched SHOW's own title ("Some Lessons Aren't Taught In Classrooms") never count; the
     comparison ignores case, accents and punctuation. A year in brackets - "(2025)" - marks a release name, not a
     course, so it switches every word signal off (a numbered lecture name stays strong)."""
@@ -4665,6 +5231,10 @@ def _edu_level(names, show_names=()) -> int:
             return 2
         if _EDU_RE.search(rest):
             level = 1
+    if level < 2 and EDU_EXAM_RULES:
+        sig = _edu_signals(names, show_names)
+        if len(sig) + (1 if level == 1 else 0) >= 2:
+            level = 1                                             # soft: a source that knows the title still wins
     return level
 
 
@@ -4846,6 +5416,7 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
              "reason": "", "runtime": None, "title": first.get("clean_title") or first["titles"][0],
              "language": first.get("language"), "ambiguous": False, "to_anime": None,
              "season_pack": any(pp.get("season_pack") for pp in parsed),       # "S01 Combined": the length gate skips it
+             "pack": is_season_pack(parsed),                                   # any season pack (S01 / Season 1 / Batch ...)
              "tv_source": any(pp.get("tv_source") for pp in parsed),
              "looked_series": any(pp.get("strong_episode") or pp.get("is_episode") or pp.get("series_like")
                                   or pp.get("tv_source") for pp in parsed)}
@@ -4903,7 +5474,9 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
                     language=first.get("language") or ap0.get("language"),
                     season=first.get("season") or ap0.get("season"),
                     episode=first.get("episode") or ap0.get("episode"),
-                    source="-", verdict=None, anilist="-")
+                    source="-", verdict=None, anilist="-", pack=sinfo["pack"])
+        if not use_anilist:
+            _offline_db_kick()                       # AniList is off: start loading the offline anime database (background)
         if await _anime_first_pass(session, parsed, use_anilist, anilist_key, minutes, info, tmdb_key):
             src = info["anime"].get("source") or "anilist"
             sinfo["reason"] = f"{src}: anime (asked before TMDB)"
@@ -5295,6 +5868,14 @@ def _anime_info(name: str) -> dict:
 
     if len(re.findall(r"[A-Za-z0-9]", title)) < 2 or _generic_title(title):
         return out
+    alts = []
+    if TITLE_ALT_SPLIT:
+        try:                                                  # "Ne Zha A.K.A. Nezha Mo tong jiang shi": every part is a title
+            parts = _split_alt_titles(title)
+            if len(parts) > 1:
+                title, alts = parts[0], [x for x in parts[1:] if not _generic_title(x) and not _extra_title_junk(x, pipe_list=False)]
+        except Exception as e:
+            logger.warning("anime alternate-title split failed on %r: %s - old behaviour", name, e)
     stripped, s_season, s_part = _strip_season_words(title)
     out["season"] = season if season is not None else s_season
     out["part"] = s_part
@@ -5302,6 +5883,9 @@ def _anime_info(name: str) -> dict:
     titles = [title]
     if stripped and _norm_cmp(stripped) != _norm_cmp(title) and not _generic_title(stripped):
         titles.append(stripped)
+    for x in alts:
+        if _norm_cmp(x) not in {_norm_cmp(t) for t in titles}:
+            titles.append(x)
     out["titles"] = titles
     return out
 
@@ -5381,6 +5965,8 @@ def _anime_attach(p: dict, raw_name: str, check_extra: bool) -> None:
 
 # ---- AniList: scored choice (deep_anime) -----------------------------------------------------------
 _ANILIST_EP_FORMATS = {"TV", "TV_SHORT", "ONA", "OVA", "SPECIAL"}
+# ANILIST_ANY_ORIGIN: formats an entry of ANY country of origin may have to count as anime (type ANIME is in the query)
+_ANILIST_ANY_FORMATS = {"TV", "TV_SHORT", "ONA", "OVA", "MOVIE", "SPECIAL"}
 
 
 def _anime_score(q: str, n: str) -> float:
@@ -5392,6 +5978,8 @@ def _anime_score(q: str, n: str) -> float:
         return 1.0
     if _DIGITS.findall(q) != _DIGITS.findall(n):
         return 0.0
+    if _keys_equal(q, n):
+        return 1.0                                            # punctuation / spacing only ("Dr. Stone" = "Dr Stone")
     return _sim(q, n)
 
 
@@ -5417,8 +6005,10 @@ def _anilist_best_match_deep(results, queries, year, strict: bool, ctx: dict):
         fmt = r.get("format")
         if fmt == "MUSIC":
             continue
-        if (r.get("countryOfOrigin") or "JP") not in ANILIST_ORIGINS:
-            continue
+        origin = r.get("countryOfOrigin") or "JP"
+        foreign = origin not in ANILIST_ORIGINS
+        if foreign and not (ANILIST_ANY_ORIGIN and ctx.get("any_origin") and fmt in _ANILIST_ANY_FORMATS):
+            continue                                          # old rule: only JP / CN / KR / TW (or any-origin rules below)
         t = r.get("title") or {}
         names = [t.get("romaji"), t.get("english"), t.get("native")] + list(r.get("synonyms") or [])
         score, exact, seasons = 0.0, False, set()
@@ -5438,6 +6028,8 @@ def _anilist_best_match_deep(results, queries, year, strict: bool, ctx: dict):
                     exact = True
         if score < (1.0 if strict else MIN_TITLE_SCORE):
             continue
+        if foreign and not exact:
+            continue                                          # a non-Asian entry needs the EXACT normalised title, never a fuzzy one
         pop = r.get("popularity") or 0
         if strict and pop < ANILIST_STRICT_MIN_POPULARITY:
             continue
@@ -5451,6 +6043,11 @@ def _anilist_best_match_deep(results, queries, year, strict: bool, ctx: dict):
                 ey = (r.get("endDate") or {}).get("year") or (datetime.date.today().year + 1)
                 if sy and (year < sy - 1 or year > ey + 1):
                     continue
+        if foreign and year:
+            # ... and the file's year must agree (+-1) with the entry's: its first year (a series) or its year (a film)
+            sy = (r.get("startDate") or {}).get("year") or r.get("seasonYear")
+            if not sy or (year < sy - 1 or (fmt == "MOVIE" and year > sy + 1)):
+                continue
         if has_ep:
             fmt_pref = 1 if fmt in _ANILIST_EP_FORMATS else 0
         elif year:
@@ -5468,7 +6065,7 @@ def _anilist_best_match_deep(results, queries, year, strict: bool, ctx: dict):
                 note = f"file {minutes:.0f}m vs entry {dur:.0f}m per episode"
             best, best_key = r, key
             best_d = {"score": round(score, 3), "exact": exact, "format_pref": fmt_pref, "season_pref": season_pref,
-                      "dur": note}
+                      "dur": note, "foreign": origin if foreign else None}
     return best, (best_d or {})
 
 
@@ -5677,6 +6274,168 @@ async def _anime_list_lookup(session, media_type: str, tmdb_id):
     return table.get((media_type, i))
 
 
+# ---- manami-project/anime-offline-database: an offline anime authority (USE_ANIME_OFFLINE_DB) -----------------------------
+# https://github.com/manami-project/anime-offline-database  - dataset files (README, checked): anime-offline-database.jsonl
+# (JSON lines, the FIRST line is metadata, every other line is one anime), anime-offline-database-minified.json, and .zst
+# versions; "There is a latest release". Entry fields: sources (URLs: anilist.co/anime/<id>, myanimelist.net/anime/<id> ...),
+# title, type (TV | MOVIE | OVA | ONA | SPECIAL | UNKNOWN), episodes, status, animeSeason {season, year}, synonyms ...
+# NOTE: the repository was archived by its owner on 4 Jul 2026 (read-only): the last release still downloads but no longer
+# gets updates. Loaded lazily, ONCE, in a background task with its own HTTP session - a file never waits for it: until the
+# index is ready (or when the download failed) the source simply says nothing. Only a compact index is kept
+# {title key -> [(type, year, anilist id, mal id, title, episodes)]}; the big download is dropped. It is asked only when
+# AniList is OFF or FAILED (an AniList "not found" is respected), and it never raises. A hit needs the EXACT title key
+# (punctuation / spacing ignored) AND the file's year (+-1); a name with no year is only asked for an anime CANDIDATE
+# (fansub tag / known group ...). With ANILIST_ANY_ORIGIN=0 only a strong anime candidate may use it (the dataset has no
+# country of origin).
+ANIME_OFFLINE_DB_URLS = tuple(u.strip() for u in os.environ.get(
+    "ANIME_OFFLINE_DB_URL",
+    "https://github.com/manami-project/anime-offline-database/releases/latest/download/anime-offline-database.jsonl,"
+    "https://github.com/manami-project/anime-offline-database/releases/latest/download/anime-offline-database-minified.json",
+).split(",") if u.strip())
+ANIME_OFFLINE_DB_TIMEOUT_SECONDS = 180
+ANIME_OFFLINE_DB_RETRY_SECONDS = 3600
+_OFFLINE_DB = None                    # {title key: [(type, year, anilist_id, mal_id, title, episodes), ...]} once loaded
+_offline_db_task = None
+_offline_db_retry_at = 0.0
+_OFFLINE_TYPES = {"TV", "MOVIE", "OVA", "ONA", "SPECIAL"}
+_OFFLINE_AID_RE = re.compile(r"anilist\.co/anime/(\d+)")
+_OFFLINE_MID_RE = re.compile(r"myanimelist\.net/anime/(\d+)")
+
+
+def _offline_db_build(raw) -> dict:
+    """The compact index of the dataset (JSONL, or the minified JSON). Raises on an unusable download (the caller logs it)."""
+    text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    entries = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("data"), list):
+            entries.extend(x for x in obj["data"] if isinstance(x, dict))     # the minified .json: one line, {"data": [...]}
+        elif isinstance(obj, dict) and obj.get("title"):
+            entries.append(obj)                                               # (the metadata line has no title)
+    idx, count = {}, 0
+    for e in entries:
+        etype = str(e.get("type") or "").upper()
+        title = e.get("title")
+        if etype not in _OFFLINE_TYPES or not isinstance(title, str) or not title:
+            continue
+        season = e.get("animeSeason") if isinstance(e.get("animeSeason"), dict) else {}
+        year = _as_int(season.get("year")) or None
+        aid = mid = None
+        for src in e.get("sources") or []:
+            if isinstance(src, str):
+                ma, mm = _OFFLINE_AID_RE.search(src), _OFFLINE_MID_RE.search(src)
+                aid = aid or (int(ma.group(1)) if ma else None)
+                mid = mid or (int(mm.group(1)) if mm else None)
+        val = (etype, year, aid, mid, title, _as_int(e.get("episodes")) or None)
+        count += 1
+        seen = set()
+        for name in [title, *[s for s in (e.get("synonyms") or []) if isinstance(s, str)][:30]]:
+            key = _title_key(name)
+            if len(key) < 3 or key in seen:
+                continue
+            seen.add(key)
+            rows = idx.setdefault(key, [])
+            if len(rows) < 12:
+                rows.append(val)
+    if not idx:
+        raise ValueError("no usable entries in the anime-offline-database download")
+    logger.info("anime-offline-database: %d entries, %d title keys", count, len(idx))
+    return idx
+
+
+async def _offline_db_run() -> None:
+    """Background task: download + index the dataset once. Never raises; a failure is retried after an hour."""
+    global _OFFLINE_DB, _offline_db_retry_at
+    loop = asyncio.get_event_loop()
+    try:
+        raw = None
+        async with aiohttp.ClientSession() as own:
+            for url in ANIME_OFFLINE_DB_URLS:
+                try:
+                    async with own.get(url, timeout=aiohttp.ClientTimeout(total=ANIME_OFFLINE_DB_TIMEOUT_SECONDS)) as resp:
+                        if resp.status != 200:
+                            continue
+                        raw = await resp.read()
+                        break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.debug("anime-offline-database download %s failed: %s", url, e)
+        if raw is None:
+            raise RuntimeError("no download URL answered")
+        _OFFLINE_DB = await loop.run_in_executor(None, _offline_db_build, raw)
+        raw = None                                                # the big download is dropped, only the index stays
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning("anime-offline-database unavailable (%s) - not used; retry in %d min", e,
+                       ANIME_OFFLINE_DB_RETRY_SECONDS // 60)
+        try:
+            _offline_db_retry_at = loop.time() + ANIME_OFFLINE_DB_RETRY_SECONDS
+        except Exception:
+            pass
+
+
+@_new_rule(lambda *a, **k: None)
+def _offline_db_kick() -> None:
+    """Start the background load once (when it is on, not loaded, not already running, not waiting for a retry).
+    Never blocks and never raises."""
+    global _offline_db_task
+    try:
+        if not USE_ANIME_OFFLINE_DB or aiohttp is None or _OFFLINE_DB is not None:
+            return
+        loop = asyncio.get_event_loop()
+        if (_offline_db_task is not None and not _offline_db_task.done()) or loop.time() < _offline_db_retry_at:
+            return
+        _offline_db_task = loop.create_task(_offline_db_run())
+    except Exception as e:
+        logger.debug("anime-offline-database kick failed: %s", e)
+
+
+@_new_rule(lambda *a, **k: None)
+def _offline_anime_lookup(p: dict, titles, ap: dict):
+    """An AniList-shaped media dict for the entry of the anime-offline-database that IS this file, or None (not loaded, not
+    listed, year disagrees, ...). Synchronous - it only reads the index. Never raises."""
+    try:
+        idx = _OFFLINE_DB
+        if not USE_ANIME_OFFLINE_DB or not idx:
+            return None
+        if not ANILIST_ANY_ORIGIN and not (ap or {}).get("strong"):
+            return None
+        year = p.get("year") or (ap or {}).get("year")
+        candidate = bool((ap or {}).get("candidate"))
+        if not year and not candidate:
+            return None                                           # a bare title could be any same-named show
+        has_ep = bool((ap or {}).get("has_episode") or p.get("strong_episode") or p.get("is_episode"))
+        best, best_key = None, None
+        for t in titles:
+            keys = {_title_key(t), _title_key(_strip_season_words(t)[0] or t)}
+            for key in keys:
+                for row in idx.get(key) or ():
+                    etype, ey = row[0], row[1]
+                    if year and not (ey and abs(ey - year) <= 1):
+                        continue
+                    pref = 1 if ((etype != "MOVIE") == has_ep) else 0
+                    k = (pref, -(abs(ey - year) if (ey and year) else 0), -(ey or 9999))
+                    if best is None or k > best_key:
+                        best, best_key = row, k
+        if best is None:
+            return None
+        etype, ey, aid, mid, title, eps = best
+        return {"id": aid, "idMal": mid, "format": etype, "seasonYear": ey, "startDate": {"year": ey}, "endDate": {},
+                "popularity": 0, "countryOfOrigin": None, "title": {"romaji": title, "english": None, "native": None},
+                "synonyms": [], "episodes": eps, "duration": None}
+    except Exception as e:
+        logger.warning("anime-offline-database lookup failed for %r: %s - ignored", titles, e)
+        return None
+
+
 # ---- lookup (AniList first, Jikan when AniList failed), cache, first pass --------------------------------
 _ANIME_CACHE: "OrderedDict" = OrderedDict()      # (title without season markers, year | None, strict) -> verdict dict
 
@@ -5707,9 +6466,21 @@ async def _anime_lookup_core(session, p: dict, anilist_key: str, use_anilist: bo
     episodes of one show cost one to three requests."""
     off = {"status": "off", "source": "-", "media": None, "d": {}, "cached": False}
     ap = p.get("anime") or {}
-    titles = [t for t in (ap.get("titles") or p.get("titles") or []) if t and not _generic_title(t)][:2]
-    if not titles or not use_anilist:
+    titles = [t for t in (ap.get("titles") or p.get("titles") or []) if t and not _generic_title(t)][:(4 if TITLE_ALT_SPLIT else 2)]
+
+    def _offline(why: str):
+        """The anime-offline-database's answer when AniList is OFF / FAILED, else None (see _offline_anime_lookup)."""
+        media = _offline_anime_lookup(p, titles, ap)
+        if media is None:
+            return None
+        return {"status": "found", "source": "offline", "media": media, "d": {"offline": why}, "cached": False}
+
+    if not titles:
         return off
+    if not use_anilist:
+        _offline_db_kick()
+        return _offline("AniList is off") or off
+    # (AniList is on: the offline database is only the last resort when AniList and Jikan both FAILED, below)
     year = p.get("year") or ap.get("year")
     base = _strip_season_words(_norm_cmp(titles[0]))[0] or _norm_cmp(titles[0])
     # strict (exact title + popularity) for a name with no release signal AND for a SOFT anime candidate: naming alone
@@ -5723,11 +6494,18 @@ async def _anime_lookup_core(session, p: dict, anilist_key: str, use_anilist: bo
                 "cached": True}
 
     ctx = {"episode": bool(ap.get("has_episode") or p.get("strong_episode") or p.get("is_episode")),
-           "season": ap.get("season") or p.get("season"), "minutes": minutes}
+           "season": ap.get("season") or p.get("season"), "minutes": minutes,
+           "any_origin": ANILIST_ANY_ORIGIN}
     queries = [_norm_cmp(t) for t in titles]
+    search_titles = list(titles)
+    if TITLE_SPACE_VARIANTS:                                  # "House Mates" -> "Housemates" for the AniList search
+        for v in _space_variants(titles[0])[:1]:
+            if _norm_cmp(v) not in queries and len(search_titles) < 4:
+                search_titles.append(v)
+                queries.append(_norm_cmp(v))
 
     errored = False
-    for title in titles:
+    for title in search_titles:
         results = await _anilist_search(session, title, anilist_key)
         if results is _TMDB_ERROR:
             errored = True
@@ -5743,8 +6521,9 @@ async def _anime_lookup_core(session, p: dict, anilist_key: str, use_anilist: bo
         return dict(rec, cached=False)
 
     # AniList FAILED (not "not found"): Jikan answers instead - never as an extra vote
+    _offline_db_kick()
     if not USE_JIKAN:
-        return {"status": "error", "source": "-", "media": None, "d": {}, "cached": False}
+        return _offline("AniList failed") or {"status": "error", "source": "-", "media": None, "d": {}, "cached": False}
     j_errored = False
     for title in titles:
         results = await _jikan_search(session, title)
@@ -5756,8 +6535,9 @@ async def _anime_lookup_core(session, p: dict, anilist_key: str, use_anilist: bo
             rec = {"status": "found", "source": "jikan", "media": match, "d": d}
             _anime_cache_put(ck, rec)
             return dict(rec, cached=False)
-    # Jikan answered "not found" while AniList is unknown: report it, but do not cache it
-    return {"status": "error" if j_errored else "none", "source": "jikan", "media": None, "d": {}, "cached": False}
+    # Jikan answered "not found" while AniList is unknown: the offline database may know it; else report, do not cache
+    return _offline("AniList failed") or {"status": "error" if j_errored else "none", "source": "jikan", "media": None,
+                                           "d": {}, "cached": False}
 
 
 def _anime_cache_put(key, rec: dict) -> None:
@@ -5879,6 +6659,12 @@ async def _anime_first_pass(session, parsed, use_anilist: bool, anilist_key: str
         _anime_note(info, source=res["source"], verdict="anime", **_anime_media_fields(res["media"], res["source"]))
         if res["d"].get("dur"):
             a.setdefault("notes", []).append(res["d"]["dur"])
+        if res["d"].get("foreign"):
+            a.setdefault("notes", []).append(
+                f"any-origin: AniList lists it (country {res['d']['foreign']}): exact title, year agrees, "
+                f"TMDB does not say live-action")
+        if res["d"].get("offline"):
+            a.setdefault("notes", []).append(f"anime-offline-database: exact title + year ({res['d']['offline']})")
         if res["cached"]:
             a.setdefault("notes", []).append("cached verdict")
         return True
