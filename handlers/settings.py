@@ -1,11 +1,14 @@
-"""handlers/settings.py - all the commands: /fwd /forward /settings /unequify /diagnose_media /reset /resetall.
+"""handlers/settings.py - all the commands: /fwd /forward /settings /unequify /diagnose_media /reset /resetall /broadcast.
 
 The helper code lives in plugins/controls.py.
 """
 import asyncio
 import re
+import time
+import datetime
 from pyrogram.errors.exceptions.bad_request_400 import ChannelInvalid, ChannelPrivate, UsernameInvalid, UsernameNotModified
 from pyrogram import Client, enums, filters
+from pyrogram.errors import InputUserDeactivated, FloodWait, UserIsBlocked
 from core.config import Config, temp
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from pyrogram.errors.exceptions.not_acceptable_406 import ChannelPrivate as PrivateChat
@@ -1300,3 +1303,57 @@ async def settings_query(bot, query):
   elif type.startswith("alert"):
     alert = type.split('_', 1)[1]
     await query.answer(alert, show_alert=True)
+
+
+# ============================================================
+# /broadcast (owner only) - merged here from handlers/broadcast.py
+# Reply to a message with /broadcast to copy it to every user.
+# ============================================================
+@Client.on_message(filters.command("broadcast") & filters.user(Config.BOT_OWNER_ID) & filters.reply)
+async def broadcast (bot, message):
+    users = await db.get_all_users()
+    b_msg = message.reply_to_message
+    sts = await message.reply_text(
+        text='Broadcasting your messages...'
+    )
+    start_time = time.time()
+    total_users, k = await db.total_users_bots_count()
+    done = 0
+    blocked = 0
+    deleted = 0
+    failed = 0 
+    success = 0
+    async for user in users:
+        pti, sh = await broadcast_messages(int(user['id']), b_msg, bot.log)
+        if pti:
+            success += 1
+            await asyncio.sleep(2)
+        elif pti == False:
+            if sh == "Blocked":
+                blocked+=1
+            elif sh == "Deleted":
+                deleted += 1
+            elif sh == "Error":
+                failed += 1
+        done += 1
+        if not done % 20:
+            await sts.edit(f"Broadcast in progress:\n\nTotal Users {total_users}\nCompleted: {done} / {total_users}\nSuccess: {success}\nBlocked: {blocked}\nDeleted: {deleted}")    
+    time_taken = datetime.timedelta(seconds=int(time.time()-start_time))
+    await sts.edit(f"Broadcast Completed:\nCompleted in {time_taken} seconds.\n\nTotal Users {total_users}\nCompleted: {done} / {total_users}\nSuccess: {success}\nBlocked: {blocked}\nDeleted: {deleted}")
+
+async def broadcast_messages(user_id, message, log):
+    try:
+        await message.copy(chat_id=user_id)
+        return True, "Success"
+    except FloodWait as e:
+        await asyncio.sleep(getattr(e, "value", None) or getattr(e, "x", 0))
+        return await broadcast_messages(user_id, message, log)
+    except InputUserDeactivated:
+        await db.delete_user(int(user_id))
+        log.info(f"{user_id}-Removed from Database, since deleted account.")
+        return False, "Deleted"
+    except UserIsBlocked:
+        log.info(f"{user_id} -Blocked the bot.")
+        return False, "Blocked"
+    except Exception as e:
+        return False, "Error"
