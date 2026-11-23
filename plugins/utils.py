@@ -239,10 +239,13 @@ def text_without_links(message):
 # ============================================================
 # /autosort rewrites the caption of a MOVIE / SERIES / ANIME file (and their "_files" document variants)
 # into a short, uniform caption built from the name found in the caption (the file name is the fallback):
-#     movie            <b>Sahasam (2025)</b>
+#     movie            Sahasam (2025)
 #                      1080p • WEB-DL • Malayalam
-#     series / anime   <b>My Hero Academia S06E15 - Tartarus</b>
+#     series / anime   My Hero Academia S06E15 - Tartarus
 #                      1080p • WEB-DL • NF • HEVC • 10bit • Hindi + English • DDP5.1 • ESub
+# (plain text: no bold or other formatting)
+# A video the classifier left in "other" but whose name is clearly a release (year / SxxExx + BluRay / WEB-DL / x264 ...)
+# gets the same caption, built from its file name.
 # Every other kind of file (education, pdf, files, audio, image, other ...) keeps its caption exactly as it is:
 # only the LINKS are removed from it, the words stay. The rule is decided by the category the classifier gave
 # the file (before the Movie / Series / Anime gates), so a real movie that a gate sent to Other is still captioned.
@@ -435,12 +438,24 @@ def _parse_media_name(raw: str, episodic: bool):
     tags += [lang_txt, " + ".join(audio[:3]) if audio else None, sub]
     tags = [t for t in tags if t]
     return {"name": name, "year": year, "ep": ep, "ep_title": ep_title, "tags": tags,
+            "tech": bool(src or codecs),
             "score": bool(year) + 2 * bool(ep) + len(tags)}
 
 
+_VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".webm", ".mov", ".m4v", ".wmv", ".flv", ".ts")
+
+
 def media_caption(message, classified):
-    """HTML caption for a classified movie / series / anime file, or None when it cannot be built."""
-    if classified not in _MEDIA_MOVIE + _MEDIA_EPISODIC:
+    """Plain-text caption (HTML-escaped, no tags) for a movie / series / anime file, or None when it cannot be built.
+    classified = movie / series / anime (+ "_files"): the category decides the layout.
+    classified = "other": a VIDEO file the classifier could not place (TMDB had no match ...) is still captioned from its
+    file name when the name is clearly a release - a year or SxxExx AND a source / codec tag (BluRay, WEB-DL, x264 ...);
+    SxxExx -> series layout, otherwise movie layout. A lecture / random video has no such name and is left alone."""
+    auto = classified == "other"
+    if not auto and classified not in _MEDIA_MOVIE + _MEDIA_EPISODIC:
+        return None
+    fn = get_filename(message)
+    if auto and not (getattr(message, "video", None) is not None or (fn and fn.lower().endswith(_VIDEO_EXTS))):
         return None
     episodic = classified in _MEDIA_EPISODIC
     candidates = []
@@ -450,16 +465,21 @@ def media_caption(message, classified):
             t = _plain_text(ln)
             if len(re.findall(r"\w", t)) >= 3 and not _is_label_or_promo(t):
                 candidates.append(t)
-    fn = get_filename(message)                                      # 2. the file name
-    if fn:
+    if fn:                                                          # 2. the file name
         candidates.append(fn)
-    best = None
+    best, best_src = None, None
     for c in candidates[:12]:
         info = _parse_media_name(c, episodic)
+        if auto and info and not (info["tech"] and (info["year"] or info["ep"])):
+            continue                                                # not clearly a release name
         if info and (best is None or info["score"] > best["score"]):   # a tie keeps the earlier (caption) line
-            best = info
+            best, best_src = info, c
     if not best or best["score"] <= 0:
         return None
+    if auto:
+        episodic = bool(best["ep"])
+        if episodic:                                                # parse again with the episode-title rules on
+            best = _parse_media_name(best_src, True) or best
     esc = lambda x: _html.escape(x, quote=False)
     if episodic:
         head = esc(best["name"])
@@ -471,7 +491,7 @@ def media_caption(message, classified):
             head += f" ({best['year']})"
     else:
         head = esc(best["name"]) + (f" ({best['year']})" if best["year"] else "")
-    out = f"<b>{head}</b>"
+    out = head                                  # plain text, no bold / formatting tags
     if best["tags"]:
         out += "\n" + esc(" • ".join(best["tags"]))
     return out
