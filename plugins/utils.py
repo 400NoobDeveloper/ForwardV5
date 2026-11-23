@@ -84,22 +84,19 @@ def _is_label_or_promo(line: str) -> bool:
     return (not c) or c in _CAP_LABELS or c.startswith(_CAP_PROMO_PREFIXES)
 
 
-def clean_caption(message, enabled=True):
-    """Cleaned, HTML-safe caption text (the media/movie name line), or None
-    when the toggle is off, there is no caption, or the caption is already
-    just that line. Line choice, best first:
+def _pick_name_line(message):
+    """Plain (not HTML-escaped) name line of a message: the caption line that holds the media / movie
+    name, else the media's own file name, else None. Line choice, best first:
       1. a line ending in a file extension (".mkv", ".mp4", ".pdf" ...)
       2. a line with a year/SxxExx marker AND a quality tag (720p, WEB-DL...)
       3. the first line that isn't a label ("FILENAME"), link or promo
       4. the media's own file name
     """
-    if not enabled:
-        return None
     caption = getattr(message, "caption", None)
-    if not caption:
-        return None
-    raw_lines = [ln for ln in str(caption).splitlines() if ln.strip()]
-    lines = [t for t in (_plain_text(ln) for ln in raw_lines) if len(re.findall(r"\w", t)) >= 2]
+    lines = []
+    if caption:
+        raw_lines = [ln for ln in str(caption).splitlines() if ln.strip()]
+        lines = [t for t in (_plain_text(ln) for ln in raw_lines) if len(re.findall(r"\w", t)) >= 2]
 
     chosen = None
     for t in lines:                                   # 1. file extension
@@ -119,6 +116,19 @@ def clean_caption(message, enabled=True):
                 break
     if chosen is None:                                # 4. the media's file name
         chosen = get_filename(message)
+    return chosen or None
+
+
+def clean_caption(message, enabled=True):
+    """Cleaned, HTML-safe caption text (the media/movie name line), or None
+    when the toggle is off, there is no caption, or the caption is already
+    just that line. See _pick_name_line() for how the line is chosen."""
+    if not enabled:
+        return None
+    caption = getattr(message, "caption", None)
+    if not caption:
+        return None
+    chosen = _pick_name_line(message)
     if not chosen:
         return None
 
@@ -132,8 +142,21 @@ def clean_caption(message, enabled=True):
 
 _CAP_ANCHOR_RE = re.compile(r"<a\s+([^>]*)>(.*?)</a>", re.S | re.I)
 _CAP_HREF_RE = re.compile(r'href="([^"]*)"', re.I)
-_CAP_BARE_URL_RE = re.compile(r"(?:https?://|www\.|t\.me/|telegram\.me/)[^\s<>\"']+", re.I)
+_LINK_TLDS = (
+    r"(?:com|net|org|in|me|co|cc|to|ws|tv|xyz|club|site|info|biz|link|pro|lol|ink|ltd|vip|top|fun|live|"
+    r"store|app|cloud|tech|mobi|online|art|one|tf|lat|cam|rest|bar|mov|wtf|life|fit|ai|io|pw|gg|fyi|red|"
+    r"nl|uk|us|ru|cx|mx|pm|ag|ac|bz|vc|sh|so|ist|zip|ly|gl|ph|dog|page|run|dev|ge|is|gd|cutt\.ly)"
+)
+# a link written as text: scheme://..., tg://..., t.me/..., www.x.y, and a domain WITH a path (bit.ly/abc,
+# example.com/page). A bare "name.com" with no path is NOT touched here: it is usually part of a file name
+# ("...-4kHdHub.Com.mkv"); when Telegram itself made it a link it arrives as an <a> tag and goes below.
+_CAP_BARE_URL_RE = re.compile(
+    r"(?:(?:https?|tg|ftp)://|www\.|t\.me/|telegram\.(?:me|dog)/|telegra\.ph/)[^\s<>\"']+"
+    r"|(?<![\w@./-])(?:[A-Za-z0-9-]+\.)+" + _LINK_TLDS + r"/[^\s<>\"']*",
+    re.I,
+)
 _LINK_MARK = "\x00"
+_TIDY_EXT = r"(?:mkv|mp4|avi|webm|mov|m4v|wmv|flv|mp3|m4a|flac|pdf|zip|rar|7z|srt|ass)"
 
 
 def _norm_url(u: str) -> str:
@@ -143,10 +166,11 @@ def _norm_url(u: str) -> str:
 def remove_links_html(html_text: str) -> str:
     """Delete every link from a caption / message text (HTML) and keep
     everything else exactly as it is:
-      * a hidden link ("<a href=..>Movie Name</a>") keeps its words;
+      * a hidden link ("<a href=..>Movie Name</a>") keeps its words (only the link goes);
       * a link that shows its own address (a visible URL) is removed;
-      * bare URLs / t.me links in plain text are removed;
-      * a line that held nothing but links disappears.
+      * bare URLs (https://, tg://, t.me/, www., domain/path) in plain text are removed;
+      * a line that held nothing but links disappears;
+      * what a removed link leaves behind is tidied ("Join :" -> "Join", "AV1-.mkv" -> "AV1.mkv").
     Returns "" when nothing but links was there."""
     def _anchor(m):
         href = (_CAP_HREF_RE.search(m.group(1)) or [None, ""])[1]
@@ -154,7 +178,8 @@ def remove_links_html(html_text: str) -> str:
         plain = re.sub(r"<[^>]+>", "", inner).strip()
         shows_url = (
             _norm_url(plain) == _norm_url(href)
-            or re.match(r"^(https?://|www\.|t\.me/)\S+$", plain, re.I)
+            or re.match(r"^(?:(?:https?|tg|ftp)://|www\.|t\.me/|telegram\.(?:me|dog)/)\S+$", plain, re.I)
+            or re.match(r"^(?:[A-Za-z0-9-]+\.)+" + _LINK_TLDS + r"(?:/\S*)?$", plain, re.I)
         )
         return _LINK_MARK if shows_url else inner
 
@@ -169,8 +194,13 @@ def remove_links_html(html_text: str) -> str:
     out = []
     for line in s.split("\n"):
         if _LINK_MARK in line:
-            line = re.sub(r"[ \t]{2,}", " ", line.replace(_LINK_MARK, "")).rstrip()
-            if not line.strip():
+            line = line.replace(_LINK_MARK, "")
+            line = re.sub(r"[ \t]{2,}", " ", line)
+            line = re.sub(r"(?i)[-_.]+(\.%s)(?![A-Za-z0-9])" % _TIDY_EXT, r"\1", line)   # "AV1-.mkv" -> "AV1.mkv"
+            line = re.sub(r"(?:\s*[:\-–—|~•>»➤➜]+)+\s*$", "", line).rstrip()              # dangling "Join :" / "Link -"
+            line = re.sub(r"^\s*(?:[:\-–—|~•>»➤➜]+\s*)+", "", line)                         # dangling start
+            line = re.sub(r"(?:\(\s*\)|\[\s*\]|\{\s*\})", "", line).strip()                  # empty brackets
+            if not re.sub(r"<[^>]+>", "", line).strip():
                 continue                      # that line was only a link
         out.append(line)
     return "\n".join(out).strip()
@@ -202,6 +232,260 @@ def text_without_links(message):
     """Same for plain text messages: None = copy as is, str = send this text
     instead ("" = the message was only links)."""
     return _without_links(getattr(message, "text", None))
+
+
+# ============================================================
+# /autosort caption
+# ============================================================
+# /autosort rewrites the caption of a MOVIE / SERIES / ANIME file (and their "_files" document variants)
+# into a short, uniform caption built from the name found in the caption (the file name is the fallback):
+#     movie            <b>Sahasam (2025)</b>
+#                      1080p • WEB-DL • Malayalam
+#     series / anime   <b>My Hero Academia S06E15 - Tartarus</b>
+#                      1080p • WEB-DL • NF • HEVC • 10bit • Hindi + English • DDP5.1 • ESub
+# Every other kind of file (education, pdf, files, audio, image, other ...) keeps its caption exactly as it is:
+# only the LINKS are removed from it, the words stay. The rule is decided by the category the classifier gave
+# the file (before the Movie / Series / Anime gates), so a real movie that a gate sent to Other is still captioned.
+# When no usable name can be found, nothing is rebuilt: the original caption (links removed) is used.
+_MEDIA_MOVIE = ("movie", "movie_files")
+_MEDIA_EPISODIC = ("series", "series_files", "anime", "anime_files")
+
+_LANGS = (
+    "Hindi", "English", "Tamil", "Telugu", "Malayalam", "Kannada", "Bengali", "Bangla", "Marathi", "Punjabi",
+    "Gujarati", "Urdu", "Bhojpuri", "Odia", "Japanese", "Korean", "Chinese", "Mandarin", "Cantonese", "Spanish",
+    "French", "German", "Russian", "Thai", "Arabic", "Turkish", "Italian", "Indonesian", "Portuguese",
+)
+_LANG_ALT = "|".join(_LANGS)
+_LANG_RE = re.compile(rf"(?<![A-Za-z0-9])({_LANG_ALT})(?![A-Za-z0-9])", re.I)
+_LANG_TAIL_RE = re.compile(
+    rf"[\(\[]\s*((?:{_LANG_ALT})(?:\s*[+&,/-]\s*(?:{_LANG_ALT}))*)\s*[\)\]]\s*$", re.I)
+_RES_RE = re.compile(r"(?<![A-Za-z0-9])(2160p|1440p|1080p|720p|576p|540p|480p|360p|4k|uhd)(?![A-Za-z])", re.I)
+_SRC_RE = re.compile(
+    r"(?<![A-Za-z0-9])(web[ -]?dl|web[ -]?rip|blu[ -]?ray|bd[ -]?rip|br[ -]?rip|hd[ -]?rip|dvd[ -]?rip|hdtv|"
+    r"hd[ -]?cam|cam[ -]?rip|hdts|remux)(?![A-Za-z0-9])", re.I)
+_PLATFORM_RE = re.compile(
+    r"(?<![A-Za-z0-9])(nf|amzn|dsnp|zee5|jiohs|sonyliv|sliv|hulu|atvp|hmax|pcok|pmtp|altb|sunnxt)(?![A-Za-z0-9])", re.I)
+_CODEC_RE = re.compile(r"(?<![A-Za-z0-9])(x\.?265|h[ .]?265|hevc|x\.?264|h[ .]?264|avc|av1)(?![A-Za-z0-9])", re.I)
+_BIT_RE = re.compile(r"(?<![A-Za-z0-9])10[ -]?bit(?![A-Za-z0-9])", re.I)
+_HDR_RE = re.compile(r"(?<![A-Za-z0-9])(hdr10\+?|hdr|dolby[ ]?vision)(?![A-Za-z0-9])", re.I)
+_AUDIO_RE = re.compile(
+    r"(?<![A-Za-z0-9])(ddp|dd\+|dd|eac3|ac3|aac|dts-hd|dts|truehd|atmos|flac|opus)[ .]?(\d\.\d)?(?![A-Za-z])", re.I)
+_SUB_RE = re.compile(r"(?<![A-Za-z0-9])(e-?subs?|m-?subs?|multi[ ]?subs?|hard[ ]?subs?|subbed)(?![A-Za-z0-9])", re.I)
+_DUB_RE = re.compile(r"(?<![A-Za-z0-9])(dual[ ]audio|multi[ ]audio|tri[ ]audio|dubbed)(?![A-Za-z0-9])", re.I)
+_EP_RE = re.compile(
+    r"(?<![A-Za-z0-9])S(\d{1,2})[ ]?E(\d{1,4})(?:[ ]?[-–][ ]?E?(\d{1,4})|E(\d{1,4}))?(?![A-Za-z0-9])", re.I)
+_EP_X_RE = re.compile(r"(?<![A-Za-z0-9])(\d{1,2})x(\d{2,3})(?![A-Za-z0-9])", re.I)
+_EP_WORD_RE = re.compile(r"(?<![A-Za-z0-9])(?:ep|episode)[ ]?(\d{1,4})(?![A-Za-z0-9])", re.I)
+_EP_ABS_RE = re.compile(r"\s-\s(\d{1,4})(?:v\d)?(?=\s|$)")
+_SEASON_RE = re.compile(r"(?<![A-Za-z0-9])(?:season[ ]?(\d{1,2})|S(\d{1,2}))(?![A-Za-z0-9])", re.I)
+_YEAR_PAREN_RE = re.compile(r"[\(\[]\s*((?:19|20)\d{2})\s*[\)\]]")
+_YEAR_RE = re.compile(r"(?<![A-Za-z0-9])((?:19|20)\d{2})(?![A-Za-z0-9])")
+_NAME_DOMAIN_RE = re.compile(
+    r"(?<![\w])(?:www\.)?\w+(?:\.\w+)*?\.(?:com|net|org|in|me|co|cc|to|tv|xyz|club|site|info|biz|link|pro|vip|top|"
+    r"live|cloud|app|io|ws|lol|tf|ink|cam|mov|ai|pw|gg|life|fun|online|store|tech|world|one)(?![A-Za-z0-9])", re.I)
+_LEAD_TAG_RE = re.compile(r"^\s*[\[\(【「][^\]\)】」]{1,40}[\]\)】」]\s*(?=\S)")
+_AUDIO_NORM = {"ddp": "DDP", "dd+": "DD+", "dd": "DD", "eac3": "EAC3", "ac3": "AC3", "aac": "AAC",
+               "dts-hd": "DTS-HD", "dts": "DTS", "truehd": "TrueHD", "atmos": "Atmos", "flac": "FLAC", "opus": "Opus"}
+
+
+def _dedupe(items):
+    seen, out = set(), []
+    for it in items:
+        k = it.lower()
+        if it and k not in seen:
+            seen.add(k)
+            out.append(it)
+    return out
+
+
+def _spaced(text: str) -> str:
+    """Release-style text -> readable text: "Blue.Eye.Samurai.S01E03.720p" -> "Blue Eye Samurai S01E03 720p".
+    A dot between two digits stays ("AAC5.1", "DDP2.0", "H.265" keeps its form through _CODEC_RE)."""
+    text = _CAP_EXT_RE.sub("", text) if _CAP_EXT_RE.search(text[-6:]) else text
+    text = _NAME_DOMAIN_RE.sub(" ", text)                          # site tags: 4kHdHub.Com, 1TamilMV.tf
+    text = re.sub(r"(?<=\D)\.(?=\S)|(?<=\S)\.(?=\D)|_", " ", text)   # separators, but not 5.1 / 2.0
+    text = re.sub(r"(?<=[A-Za-z])-(?=\d{3,4}p)", " ", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def _parse_media_name(raw: str, episodic: bool):
+    """Pull name / year / season-episode / episode title / tags out of one release-style line (a caption
+    line or a file name). Returns a dict, or None when no usable name is there."""
+    text = _spaced(_plain_text(raw))
+    text = _CAP_LABEL_PREFIX_RE.sub("", text).strip()
+    for _ in range(3):                                              # leading fansub / uploader tag: [SubsPlease]
+        stripped = _LEAD_TAG_RE.sub("", text)
+        if stripped == text or len(re.findall(r"[A-Za-z]", stripped)) < 2:
+            break
+        text = stripped
+    text = re.sub(r"^\s*[\-–—:|~]+\s*", "", text)
+    if not text:
+        return None
+
+    # ---- episode markers
+    ep = season = episode = None
+    ep_m = _EP_RE.search(text)
+    ep_pos = None
+    if ep_m:
+        season, episode = int(ep_m.group(1)), int(ep_m.group(2))
+        last = ep_m.group(3) or ep_m.group(4)
+        ep = f"S{season:02d}E{episode:02d}" + (f"-E{int(last):02d}" if last else "")
+        ep_pos = (ep_m.start(), ep_m.end())
+    else:
+        xm = _EP_X_RE.search(text)
+        if xm:
+            season, episode = int(xm.group(1)), int(xm.group(2))
+            ep, ep_pos = f"S{season:02d}E{episode:02d}", (xm.start(), xm.end())
+        elif episodic:
+            wm = _EP_WORD_RE.search(text)
+            if wm:
+                ep, ep_pos = f"E{int(wm.group(1)):02d}", (wm.start(), wm.end())
+            else:
+                am = _EP_ABS_RE.search(text)
+                if am:
+                    ep, ep_pos = f"E{int(am.group(1)):02d}", (am.start(), am.end())
+    season_pos = None
+    if ep is None and episodic:
+        sm = _SEASON_RE.search(text)
+        if sm:
+            ep = f"S{int(sm.group(1) or sm.group(2)):02d}"
+            season_pos = (sm.start(), sm.end())
+
+    # ---- year
+    year, year_pos = None, None
+    pm = _YEAR_PAREN_RE.search(text)
+    if pm and pm.start() > 0:
+        year, year_pos = pm.group(1), (pm.start(), pm.end())
+    else:
+        bare = [m for m in _YEAR_RE.finditer(text) if m.start() > 0]
+        if bare and not episodic:
+            m = bare[-1]
+            year, year_pos = m.group(1), (m.start(), m.end())
+        elif bare:
+            m = bare[0]
+            year, year_pos = m.group(1), (m.start(), m.end())
+
+    # ---- where the name stops: the first marker or tag
+    cuts = []
+    for pos in (ep_pos, season_pos, year_pos):
+        if pos:
+            cuts.append(pos[0])
+    for rx in (_RES_RE, _SRC_RE, _CODEC_RE, _BIT_RE, _HDR_RE, _SUB_RE, _DUB_RE):
+        m = rx.search(text)
+        if m and m.start() > 0:
+            cuts.append(m.start())
+    cut = min(cuts) if cuts else len(text)
+    name = text[:cut]
+    tail = text[cut:]
+
+    langs = []
+    tm = _LANG_TAIL_RE.search(name)                                  # "Name (Hindi + Malayalam) 2025"
+    if tm:
+        langs += _LANG_RE.findall(tm.group(1))
+        name = name[: tm.start()]
+    name = re.sub(r"[\s\-–—_:|~.,(\[{【「]+$", "", name)
+    name = re.sub(r"^[\s\-–—_:|~.,)\]}】」]+", "", name)
+    name = re.sub(r"\s{2,}", " ", name).strip()
+    if len(re.findall(r"\w", name)) < 2:
+        return None
+
+    # ---- episode title (series / anime): text between the episode marker and the first tag
+    ep_title = None
+    if episodic and ep_pos:
+        rest = text[ep_pos[1]:]
+        stops = [m.start() for rx in (_RES_RE, _SRC_RE, _CODEC_RE, _BIT_RE, _HDR_RE, _SUB_RE, _DUB_RE, _AUDIO_RE,
+                                      _PLATFORM_RE, _LANG_RE)
+                 for m in [rx.search(rest)] if m]
+        stops += [i for i in (rest.find("["), rest.find("("), rest.find("{")) if i != -1]
+        rest = rest[: min(stops)] if stops else rest
+        rest = re.sub(r"^[\s\-–—_:|~.,]+|[\s\-–—_:|~.,]+$", "", rest)
+        if len(re.findall(r"[A-Za-z]", rest)) >= 2 and len(rest) <= 70:
+            ep_title = rest
+
+    # ---- tags (only after the name)
+    res = _RES_RE.search(tail)
+    res = (res.group(1).upper() if res.group(1).lower() in ("4k", "uhd") else res.group(1).lower()) if res else None
+    src = _SRC_RE.search(tail)
+    if src:
+        k = re.sub(r"[ -]", "", src.group(1).lower())
+        src = {"webdl": "WEB-DL", "webrip": "WEBRip", "bluray": "BluRay", "bdrip": "BDRip", "brrip": "BRRip",
+               "hdrip": "HDRip", "dvdrip": "DVDRip", "hdtv": "HDTV", "hdcam": "HDCAM", "camrip": "CAMRip",
+               "hdts": "HDTS", "remux": "Remux"}.get(k, src.group(1))
+    plat = _dedupe([m.upper() for m in _PLATFORM_RE.findall(tail)])[:1]
+    codecs = []
+    for c in _CODEC_RE.findall(tail):
+        c = re.sub(r"[ .]", "", c.lower())
+        codecs.append("HEVC" if c in ("x265", "h265", "hevc") else "AV1" if c == "av1" else "x264")
+    codecs = _dedupe(codecs)
+    bit = "10bit" if _BIT_RE.search(tail) else None
+    hdr = _HDR_RE.search(tail)
+    hdr = ("Dolby Vision" if hdr.group(1).lower().startswith("dolby") else hdr.group(1).upper()) if hdr else None
+    audio = _dedupe([_AUDIO_NORM.get(a.lower(), a) + (q or "") for a, q in _AUDIO_RE.findall(tail)])
+    langs += _LANG_RE.findall(tail)
+    langs = _dedupe([l.capitalize() for l in langs])
+    dub = _DUB_RE.search(tail)
+    dub = re.sub(r"\s+", " ", dub.group(1)).title() if dub else None
+    sub = "ESub" if re.search(r"e-?subs?", tail, re.I) else ("MSub" if re.search(r"m-?subs?|multi[ ]?subs?", tail, re.I)
+                                                              else None)
+
+    tags = [res, src] + plat + codecs + [bit, hdr]
+    lang_txt = " + ".join(langs) if langs else None
+    if dub and not (dub.lower().endswith("audio") and len(langs) >= 2):
+        lang_txt = f"{lang_txt} ({dub})" if lang_txt else dub
+    tags += [lang_txt, " + ".join(audio[:3]) if audio else None, sub]
+    tags = [t for t in tags if t]
+    return {"name": name, "year": year, "ep": ep, "ep_title": ep_title, "tags": tags,
+            "score": bool(year) + 2 * bool(ep) + len(tags)}
+
+
+def media_caption(message, classified):
+    """HTML caption for a classified movie / series / anime file, or None when it cannot be built."""
+    if classified not in _MEDIA_MOVIE + _MEDIA_EPISODIC:
+        return None
+    episodic = classified in _MEDIA_EPISODIC
+    candidates = []
+    caption = getattr(message, "caption", None)
+    if caption:                                                     # 1. the name in the caption
+        for ln in str(caption).splitlines():
+            t = _plain_text(ln)
+            if len(re.findall(r"\w", t)) >= 3 and not _is_label_or_promo(t):
+                candidates.append(t)
+    fn = get_filename(message)                                      # 2. the file name
+    if fn:
+        candidates.append(fn)
+    best = None
+    for c in candidates[:12]:
+        info = _parse_media_name(c, episodic)
+        if info and (best is None or info["score"] > best["score"]):   # a tie keeps the earlier (caption) line
+            best = info
+    if not best or best["score"] <= 0:
+        return None
+    esc = lambda x: _html.escape(x, quote=False)
+    if episodic:
+        head = esc(best["name"])
+        if best["ep"]:
+            head += " " + best["ep"]
+            if best["ep_title"]:
+                head += " - " + esc(best["ep_title"])
+        elif best["year"]:
+            head += f" ({best['year']})"
+    else:
+        head = esc(best["name"]) + (f" ({best['year']})" if best["year"] else "")
+    out = f"<b>{head}</b>"
+    if best["tags"]:
+        out += "\n" + esc(" • ".join(best["tags"]))
+    return out
+
+
+def autosort_caption(message, classified=None, remove_links: bool = True):
+    """Caption /autosort passes to copy_message: an HTML string, or None = keep the original caption.
+      movie / series / anime (+ "_files")  -> media_caption(): name, year or season-episode, quality ...
+      everything else                      -> the caption as it is, only the links removed
+    A caption that cannot be rebuilt falls back to the second line. remove_links=False leaves links alone."""
+    built = media_caption(message, classified) if classified else None
+    if built:
+        return built
+    return _without_links(getattr(message, "caption", None)) if remove_links else None
 
 
 # ============================================================
