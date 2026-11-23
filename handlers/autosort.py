@@ -87,7 +87,7 @@ from plugins.classify import (
     SEASONPACK_SKIP_MAX_DURATION,
 )
 from pyrogram.enums import ParseMode
-from plugins.utils import check_filters, caption_for_copy, text_without_links
+from plugins.utils import check_filters, autosort_caption, text_without_links
 
 try:
     import aiohttp
@@ -107,6 +107,10 @@ _next_id = 0
 # AUTOSORT_ASK_ANILIST=1 (default): the /autosort confirmation message says whether AniList is ON for this user and, when
 # it is OFF, offers an "Enable AniList" button above Yes / No. 0 = the old message, no AniList line, no button.
 AUTOSORT_ASK_ANILIST = os.environ.get("AUTOSORT_ASK_ANILIST", "1").strip().lower() not in ("0", "false", "no", "off")
+
+# AUTOSORT_REMOVE_LINKS=1 (default): /autosort ALWAYS removes the links from every caption and text message it copies (only the
+# links, the words stay), whatever the /settings "Remove caption link" toggle says. 0 = old behaviour (only when that toggle is on).
+AUTOSORT_REMOVE_LINKS = os.environ.get("AUTOSORT_REMOVE_LINKS", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 def _new_run_id() -> str:
@@ -1085,7 +1089,7 @@ async def _run(client, user_id, m, cfg):
     seen_file_ids = set()
     other_dest = mapping["other"]
     dup_dest = mapping.get("duplicate")
-    remove_links = bool(configs.get("remove_caption_link"))
+    remove_links = AUTOSORT_REMOVE_LINKS or bool(configs.get("remove_caption_link"))
     dest_chats = list(set(mapping.values()))
     live = _LIVE[user_id] = {"stats": stats, "mapping": mapping, "pacing": pacing, "total": total_files, "paused": False}
     await _notify(client, user_id, "Forwarding Started", mapping)
@@ -1130,7 +1134,7 @@ async def _run(client, user_id, m, cfg):
                     # instead of skipping it.
                     ok = await _copy_with_retry(
                         client, dup_dest, from_chat, message.id, m, stats, mapping, pacing, total_files,
-                        caption=caption_for_copy(message, remove_links),
+                        caption=autosort_caption(message, None, remove_links),
                     )
                     if not ok:
                         ok = await _copy_with_retry(
@@ -1212,10 +1216,12 @@ async def _run(client, user_id, m, cfg):
             if egate is not None:
                 _log_education_route(message, classified, gated, category, egate, info)
 
-            # Caption -> just the media/movie name line; None = leave caption as is.
+            # Caption: movie / series / anime (+ "_files") get a rebuilt caption (name, year or season-episode,
+            # quality ...); every other category keeps its caption, only the links are removed. Decided by the
+            # classifier's category, so a real movie a gate sent to Other is still captioned. None = leave as is.
             ok = await _copy_with_retry(
                 client, dest, from_chat, message.id, m, stats, mapping, pacing, total_files,
-                caption=caption_for_copy(message, remove_links), text=new_text,
+                caption=autosort_caption(message, classified, remove_links), text=new_text,
             )
             if not ok and new_text is None:
                 # Unsupported by copy_message -> plain-forward it to Other.
