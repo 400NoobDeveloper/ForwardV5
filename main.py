@@ -3,6 +3,10 @@ import os
 import logging
 import logging.config
 import time
+import sys
+import importlib
+import importlib.abc
+import importlib.util
 from types import SimpleNamespace
 import aiohttp
 from aiohttp import web
@@ -13,6 +17,61 @@ from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 from core.database import db
 from core.config import Config
+
+# ---------------------------------------------------------------------------
+# Module locator.
+# The code imports its helpers as plugins.controls / plugins.identify /
+# plugins.channels / plugins.classify / plugins.utils / plugins.regix /
+# plugins.restart_info / handlers.start / handlers.bsetting ..., but the files
+# sit in the other folder (helpers in handlers/, commands in plugins/) or were
+# merged into another file (classify -> identify, utils -> channels,
+# regix -> forward, restart_info -> bootinfo, start -> xsetting).
+# Python only asks this finder when its normal lookup FAILS, so:
+#   * a module that exists where the import expects it is never touched;
+#   * a missing one is looked up by file name in handlers/, plugins/ and core/
+#     and the SAME module object is returned (nothing is loaded twice, so no
+#     handler is registered twice).
+# If the files are later moved to the folders the imports expect, this block
+# simply never triggers and can stay or be deleted.
+# ---------------------------------------------------------------------------
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_PKGS = ("handlers", "plugins", "core")
+_MERGED = {
+    "classify": "identify",
+    "utils": "channels",
+    "regix": "forward",
+    "restart_info": "bootinfo",
+    "start": "xsetting",
+}
+
+
+class _AliasLoader(importlib.abc.Loader):
+    def __init__(self, real_name):
+        self.real_name = real_name
+
+    def create_module(self, spec):
+        return importlib.import_module(self.real_name)
+
+    def exec_module(self, module):
+        pass
+
+
+class _ModuleLocator(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        parts = fullname.split(".")
+        if len(parts) != 2 or parts[0] not in _PKGS:
+            return None
+        base = _MERGED.get(parts[1], parts[1])
+        for pkg in _PKGS:
+            real_name = f"{pkg}.{base}"
+            if real_name != fullname and os.path.isfile(os.path.join(_APP_DIR, pkg, base + ".py")):
+                logging.getLogger(__name__).info("import %s -> %s", fullname, real_name)
+                return importlib.util.spec_from_loader(fullname, _AliasLoader(real_name))
+        return None
+
+
+if not any(isinstance(f, _ModuleLocator) for f in sys.meta_path):
+    sys.meta_path.append(_ModuleLocator())
 
 # pyrofork 2.3.x removed Message.forward_from_chat / forward_from / forward_date /
 # forward_from_message_id (it only has Message.forward_origin now). The code in
