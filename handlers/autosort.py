@@ -49,6 +49,19 @@
 #     file goes to Other.
 #   * Every file that ends in Other gets a reason (stats["other_why"], one "autosort other-route"
 #     INFO line per file). The final "completed" message lists the reason counts.
+#
+# Order of decisions for ONE file (round 3):
+#   0. NSFW keywords (AUTOSORT_NSFW_FIRST): decided BEFORE any TMDB / AniList call. The NSFW / NSFW-files channel when one is
+#      mapped, else Other with the reason nsfw_unmapped. The caption keeps its words (links removed only).
+#   1. pdf / image / audio / archive / education (strong course names): decided by the classifier before any lookup.
+#   2. Step 1 - identification: classify_async() asks TMDB, then AniList, then the fallbacks and fills info["ident"] (the
+#      canonical title / year). The caption of a movie / series / anime (+ "_files") is REBUILT from that record
+#      (plugins/utils.py ident_caption()); a file that was not identified keeps today's file-name caption.
+#   3. Step 2 - the category is decided again from the edited caption (movie vs episodic from its marker, "_files" from how
+#      the file was sent, series vs anime from the Step 1 record - TMDB / AniList are NOT asked a second time). A consistency
+#      check compares caption and record (type, season / episode, year); when they disagree it is logged and the Step 1
+#      result is used (AUTOSORT_STEP2_CHECK, default on).
+#   4. The thumbnail / duration / runtime gates, exactly as before, then the channel (or Other with the reason).
 # ============================================================
 
 import os
@@ -76,6 +89,7 @@ from plugins.classify import (
     classify_async, CATEGORIES, VIDEO_CATEGORIES, SKIP_CATEGORIES,
     UNIDENTIFIED, TMDB_UNAVAILABLE, ENV_TMDB_API_KEY,
     get_filename, movie_thumb_gate, movie_duration_minutes, tmdb_movie_runtime, runtime_mismatch, has_video_thumb,
+    is_nsfw, nsfw_category,
     is_split_video_part, SPLIT_PARTS_SKIP_DURATION,
     MOVIE_MIN_MINUTES, MOVIE_THUMB_RATIO_MIN, MOVIE_THUMB_RATIO_MAX,
     SERIES_MIN_MINUTES, SERIES_MAX_MINUTES, SERIES_THUMB_RATIO_MIN, SERIES_THUMB_RATIO_MAX, SERIES_RATIO_UNKNOWN,
@@ -87,7 +101,7 @@ from plugins.classify import (
     SEASONPACK_SKIP_MAX_DURATION,
 )
 from pyrogram.enums import ParseMode
-from plugins.utils import check_filters, autosort_caption, text_without_links
+from plugins.utils import check_filters, autosort_caption, text_without_links, ident_caption, parse_edited_caption
 
 try:
     import aiohttp
@@ -111,6 +125,16 @@ AUTOSORT_ASK_ANILIST = os.environ.get("AUTOSORT_ASK_ANILIST", "1").strip().lower
 # AUTOSORT_REMOVE_LINKS=1 (default): /autosort ALWAYS removes the links from every caption and text message it copies (only the
 # links, the words stay), whatever the /settings "Remove caption link" toggle says. 0 = old behaviour (only when that toggle is on).
 AUTOSORT_REMOVE_LINKS = os.environ.get("AUTOSORT_REMOVE_LINKS", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+# AUTOSORT_NSFW_FIRST=1 (default): a file whose name / caption carries adult-content keywords (plugins/classify.py is_nsfw()) is
+# decided BEFORE any TMDB / AniList call: the NSFW / NSFW-files channel when one is mapped, else Other (reason nsfw_unmapped).
+# 0 = old behaviour (the file goes through the normal classification).
+AUTOSORT_NSFW_FIRST = os.environ.get("AUTOSORT_NSFW_FIRST", "1").strip().lower() not in ("0", "false", "no", "off")
+
+# AUTOSORT_STEP2_CHECK=1 (default): Step 2 decides the category from the edited caption and checks it against the Step 1 record
+# (type, season / episode, year); a disagreement is logged and the Step 1 result is used. 0 = no check, the Step 1 result is used.
+AUTOSORT_STEP2_CHECK = os.environ.get("AUTOSORT_STEP2_CHECK", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 def _new_run_id() -> str:
@@ -1033,8 +1057,13 @@ def _log_education_route(message, classified, gated, final, gate, info):
 #   archive       (the classifier's reason for an archive; it goes to the Files channel, and to Other as
 #                 "unmapped" when no Files channel is mapped)
 #   other_type    not a video / pdf / image / audio / archive, or copy_message could not rebuild it
+#   unparseable   no usable title in any of the candidate names (file name + every caption line)
+#   nsfw_unmapped adult-content keywords, no NSFW channel mapped (decided before any lookup)
 #   no_thumb | ratio | duration | runtime   a movie / series / anime gate rejected a NATIVE video
 #   unmapped      the category is fine, but no channel is mapped for it in /settings
+# (the same reasons by the names you may be used to: gate_thumbnail = no_thumb / ratio, gate_runtime = runtime / duration,
+#  no_channel_mapped = unmapped.) A file the classifier gave up on had a FINAL CHECK first (plugins/classify.py _final_check()):
+#  the detail then ends with "final pass: N names, M titles, sources ...".
 def _other_why(skipped, classified, gated, final, gate, info):
     """(reason, detail) for a file that ended in Other. skipped = the SKIP category classify_async
     returned (tmdb_error / unidentified) or None; gate = the movie / series / anime gate dict or None."""
@@ -1049,14 +1078,76 @@ def _other_why(skipped, classified, gated, final, gate, info):
         return "unmapped", f"no channel mapped for {gated}"
     why = info.get("other_reason")
     if why:
-        return why, info.get("other_detail") or "-"
-    return "unidentified", "no reason reported by the classifier"
+        detail = info.get("other_detail") or "-"
+        fp = info.get("final_pass") or {}
+        if fp.get("names") and fp.get("summary") and "final pass" not in detail:
+            detail += f" | final pass: {fp['summary']}"
+        return why, detail
+    return "unidentified", "classified as other, the classifier reported no reason"
+
+
+def _nsfw_first(message) -> bool:
+    """AUTOSORT_NSFW_FIRST: True when the file's name / caption carries adult-content keywords. Never raises (a failure = False =
+    the old behaviour for this file)."""
+    if not AUTOSORT_NSFW_FIRST:
+        return False
+    try:
+        return bool(is_nsfw(message))
+    except Exception as e:
+        logger.warning("autosort: NSFW check failed for msg %s (%s) - normal classification", message.id, e)
+        return False
+
+
+def _step2(message, classified, caption, facts):
+    """Step 2: decide the category from the EDITED caption. The caption says movie (no season / episode) or episodic; the file's
+    own type says "_files" (a document) or video; series vs anime comes from the Step 1 record (TMDB / AniList are not asked
+    again). Consistency check: the caption must read back as the same type, season / episode and year as the record. Any
+    disagreement is logged (WARNING) and the Step 1 result is returned. -> the category."""
+    if not AUTOSORT_STEP2_CHECK or not caption or not facts:
+        return classified
+    got = parse_edited_caption(caption)
+    kind = facts["kind"]
+    decided = kind + ("_files" if getattr(message, "document", None) is not None else "")
+    problems = []
+    if got is None:
+        problems.append("the edited caption cannot be read back")
+    else:
+        if got["episodic"] != (kind != "movie"):
+            problems.append(f"type: caption reads {'episodic' if got['episodic'] else 'movie'}, record says {kind}")
+        if facts["year"] and got["year"] != facts["year"]:
+            problems.append(f"year: caption {got['year']}, record {facts['year']}")
+        if (facts["season"], facts["episode"]) != (got["season"], got["episode"]):
+            problems.append(f"season/episode: caption {got['season']}/{got['episode']}, record {facts['season']}/{facts['episode']}")
+    if decided != classified:
+        problems.append(f"category: caption + file type say {decided}, Step 1 said {classified}")
+    if problems:
+        logger.warning("autosort step2: msg=%s name=%r the edited caption disagrees with the identification (%s) - "
+                       "using the Step 1 result %s", message.id, _movie_label(message), "; ".join(problems), classified)
+        return classified
+    return decided
+
+
+def _edited_caption(message, classified, info, remove_links):
+    """Step 1 + Step 2 for ONE file. -> (caption for copy_message | None, category). NSFW / pdf / education / audio / image / files /
+    other keep their caption with only the links removed (autosort_caption does that); a movie / series / anime that was identified
+    gets the caption rebuilt from the identification record; one that was not identified keeps today's file-name caption."""
+    ident = (info or {}).get("ident")
+    caption = facts = None
+    if ident:
+        caption, facts = ident_caption(message, classified, ident)
+    if caption is None:
+        return autosort_caption(message, classified, remove_links), classified
+    classified = _step2(message, classified, caption, facts)
+    logger.info("autosort caption: msg=%s name=%r class=%s record=%s/%s/%s id=%s -> %r", message.id, _movie_label(message),
+                classified, ident.get("source") or "-", ident.get("title"), ident.get("year") or "-", ident.get("id") or "-",
+                caption.split("\n", 1)[0][:80])
+    return caption, classified
 
 
 def _log_other_route(message, classified, final, why, detail):
     """ONE INFO line per file that ended in Other: what it was, what the classifier said, why."""
     logger.info("autosort other-route: msg=%s name=%r class=%s final=%s reason=%s detail=%s",
-                message.id, _movie_label(message), classified, final, why, (detail or "-")[:100])
+                message.id, _movie_label(message), classified, final, why, (detail or "-")[:240])
 
 
 async def _run(client, user_id, m, cfg):
@@ -1161,17 +1252,38 @@ async def _run(client, user_id, m, cfg):
                     stats["filtered"] = stats.get("filtered", 0) + 1
                     continue
 
-            # classify_async (deep_series / deep_anime, /autosort only), asked again when TMDB failed
-            category, info, _retries = await _classify_with_retry(
-                message, tmdb_session, tmdb_key, use_anilist, anilist_key)
             skipped = None
-            if category in SKIP_CATEGORIES:
-                # TMDB unreachable (after the retries) -> don't drop it, put it in Other.
-                stats[category] += 1
-                skipped = category
-                category = "other"
+            nsfw_hit = _nsfw_first(message)
+            if nsfw_hit:
+                # 0) NSFW keywords: decided here, before any TMDB / AniList call. The NSFW channel when one is mapped, else Other.
+                info = {}
+                category = nsfw_category(message, mapping) or "other"
+                if category == "other":
+                    info = {"other_reason": "nsfw_unmapped",
+                            "other_detail": "adult-content keywords in the name / caption, no NSFW channel is mapped"}
+            else:
+                # classify_async (deep_series / deep_anime, /autosort only), asked again when TMDB failed
+                category, info, _retries = await _classify_with_retry(
+                    message, tmdb_session, tmdb_key, use_anilist, anilist_key)
+                if category in SKIP_CATEGORIES:
+                    # TMDB unreachable (after the retries) -> don't drop it, put it in Other.
+                    stats[category] += 1
+                    skipped = category
+                    category = "other"
             classified = category
             _count_hit(stats, classified, info)
+            # Step 1 (caption from the identification record) + Step 2 (category from the edited caption). Done before the
+            # gates; a failure here falls back to today's caption and the classifier's category.
+            cap_class = "nsfw" if nsfw_hit else classified          # an adult file never gets a rebuilt caption (not even the "other" one)
+            try:
+                caption, classified = _edited_caption(message, cap_class, info, remove_links)
+                if nsfw_hit:
+                    classified = category
+            except Exception as e:
+                logger.warning("autosort: caption step failed for msg %s (%s: %s) - today's caption", message.id, type(e).__name__, e)
+                caption = autosort_caption(message, cap_class, remove_links)
+                if nsfw_hit:
+                    classified = category
             # Movie channel gate (duration / thumbnail ratio / TMDB runtime). Done
             # here, not in classify_async(), which /fwd shares. A file that fails
             # is not dropped, filtered or counted as an error: it goes to Other.
@@ -1221,7 +1333,7 @@ async def _run(client, user_id, m, cfg):
             # classifier's category, so a real movie a gate sent to Other is still captioned. None = leave as is.
             ok = await _copy_with_retry(
                 client, dest, from_chat, message.id, m, stats, mapping, pacing, total_files,
-                caption=autosort_caption(message, classified, remove_links), text=new_text,
+                caption=caption, text=new_text,
             )
             if not ok and new_text is None:
                 # Unsupported by copy_message -> plain-forward it to Other.
