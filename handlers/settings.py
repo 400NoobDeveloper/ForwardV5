@@ -1,9 +1,11 @@
-"""handlers/settings.py - all the commands: /fwd /forward /settings /unequify /diagnose_media /reset /resetall /broadcast.
+"""handlers/settings.py - all the commands: /fwd /forward /settings /unequify /diagnose_media /reset /resetall /restart /broadcast.
 
 The helper code lives in plugins/controls.py.
 """
 import asyncio
+import os
 import re
+import sys
 import time
 import datetime
 from pyrogram.errors.exceptions.bad_request_400 import ChannelInvalid, ChannelPrivate, UsernameInvalid, UsernameNotModified
@@ -82,6 +84,16 @@ async def resetall(bot, message):
   if ERRORS:
      await message.reply(ERRORS[:100])
   await sts.edit("completed\n" + TEXT.format(total, success, failed, already))
+
+
+@Client.on_message(filters.private & filters.command(['restart']) & filters.user(Config.BOT_OWNER_ID))
+async def restart(client, message):
+    msg = await message.reply_text(
+        text="<i>Trying to restarting.....</i>"
+    )
+    await asyncio.sleep(5)
+    await msg.edit("<i>Server restarted successfully ✅</i>")
+    os.execl(sys.executable, sys.executable, *sys.argv)
 
 
 @Client.on_message(filters.private & filters.command("diagnose_media") & filters.reply)
