@@ -250,6 +250,18 @@ def text_without_links(message):
 # only the LINKS are removed from it, the words stay. The rule is decided by the category the classifier gave
 # the file (before the Movie / Series / Anime gates), so a real movie that a gate sent to Other is still captioned.
 # When no usable name can be found, nothing is rebuilt: the original caption (links removed) is used.
+#
+# Round 3 (Step 1 of the caption): when the classifier IDENTIFIED the file (info["ident"], plugins/classify.py), the caption
+# is rebuilt from that record instead of from the raw release name - see ident_caption():
+#     movie   Title (Year)                      + quality tags
+#     series  Title (Year) S01E05 | S01 | S01-S03 + quality tags
+#     anime   AniList title (Year) S01E05        + quality tags
+# The title / year are the canonical TMDB / AniList ones; the season / episode come from the FILE NAME first and from the
+# caption lines only for series and anime (never for a movie). parse_edited_caption() reads such a caption back (Step 2's
+# consistency check in handlers/autosort.py). Not identified: the file-name caption above is used, exactly as before.
+CAPTION_FROM_IDENT = os.environ.get("AUTOSORT_CAPTION_FROM_IDENT", "1").strip().lower() not in ("0", "false", "no", "off")
+CAPTION_SEASON_RANGE = os.environ.get("CAPTION_SEASON_RANGE", "1").strip().lower() not in ("0", "false", "no", "off")
+CAPTION_BARE_EPISODE = os.environ.get("CAPTION_BARE_EPISODE", "1").strip().lower() not in ("0", "false", "no", "off")
 _MEDIA_MOVIE = ("movie", "movie_files")
 _MEDIA_EPISODIC = ("series", "series_files", "anime", "anime_files")
 
@@ -280,9 +292,15 @@ _EP_RE = re.compile(
 _EP_X_RE = re.compile(r"(?<![A-Za-z0-9])(\d{1,2})x(\d{2,3})(?![A-Za-z0-9])", re.I)
 _EP_WORD_RE = re.compile(r"(?<![A-Za-z0-9])(?:ep|episode)[ ]?(\d{1,4})(?![A-Za-z0-9])", re.I)
 _EP_ABS_RE = re.compile(r"\s-\s(\d{1,4})(?:v\d)?(?=\s|$)")
+_EP_BARE_RE = re.compile(r"(?<![A-Za-z0-9])E(\d{2,4})(?![A-Za-z0-9])", re.I)          # "One Piece E1090", "Attack on Titan E05"
 _SEASON_RE = re.compile(r"(?<![A-Za-z0-9])(?:season[ ]?(\d{1,2})|S(\d{1,2}))(?![A-Za-z0-9])", re.I)
 _YEAR_PAREN_RE = re.compile(r"[\(\[]\s*((?:19|20)\d{2})\s*[\)\]]")
 _YEAR_RE = re.compile(r"(?<![A-Za-z0-9])((?:19|20)\d{2})(?![A-Za-z0-9])")
+# a season-pack RANGE: "S01-S03", "S01 to S03", "Season 1-3", "Seasons 1 & 2" (the second part needs an S / season word or
+# comes after the word "season", so "S01-720p" and "S01-05" are not ranges)
+_SEASON_RANGE_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:seasons?[ ]?(\d{1,2})[ ]?(?:-|–|to|&)[ ]?(?:s(?:eason)?[ ]?)?(\d{1,2})"
+    r"|S(\d{1,2})[ ]?(?:-|–|to)[ ]?S(\d{1,2}))(?![A-Za-z0-9])", re.I)
 _NAME_DOMAIN_RE = re.compile(
     r"(?<![\w])(?:www\.)?\w+(?:\.\w+)*?\.(?:com|net|org|in|me|co|cc|to|tv|xyz|club|site|info|biz|link|pro|vip|top|"
     r"live|cloud|app|io|ws|lol|tf|ink|cam|mov|ai|pw|gg|life|fun|online|store|tech|world|one)(?![A-Za-z0-9])", re.I)
@@ -341,13 +359,22 @@ def _parse_media_name(raw: str, episodic: bool):
             ep, ep_pos = f"S{season:02d}E{episode:02d}", (xm.start(), xm.end())
         elif episodic:
             wm = _EP_WORD_RE.search(text)
+            bm = _EP_BARE_RE.search(text) if (CAPTION_BARE_EPISODE and not wm) else None
             if wm:
                 ep, ep_pos = f"E{int(wm.group(1)):02d}", (wm.start(), wm.end())
+            elif bm:
+                ep, ep_pos = f"E{int(bm.group(1)):02d}", (bm.start(), bm.end())
             else:
                 am = _EP_ABS_RE.search(text)
                 if am:
                     ep, ep_pos = f"E{int(am.group(1)):02d}", (am.start(), am.end())
     season_pos = None
+    if ep is None and episodic and CAPTION_SEASON_RANGE:
+        rm = _SEASON_RANGE_RE.search(text)
+        if rm:
+            lo, hi = int(rm.group(1) or rm.group(3)), int(rm.group(2) or rm.group(4))
+            if 1 <= lo < hi <= 99:
+                ep, season_pos = f"S{lo:02d}-S{hi:02d}", (rm.start(), rm.end())
     if ep is None and episodic:
         sm = _SEASON_RE.search(text)
         if sm:
@@ -506,6 +533,85 @@ def autosort_caption(message, classified=None, remove_links: bool = True):
     if built:
         return built
     return _without_links(getattr(message, "caption", None)) if remove_links else None
+
+
+_IDENT_KINDS = ("movie", "series", "anime")
+
+
+def _ep_numbers(ep):
+    """"S01E05" -> (1, 5); "S01E05-E06" -> (1, 5); "S01" -> (1, None); "S01-S03" -> (1, None); "E05" -> (None, 5); None -> (None, None)."""
+    if not ep:
+        return None, None
+    m = re.match(r"S(\d+)(?:E(\d+))?", ep, re.I) or re.match(r"()E(\d+)", ep, re.I)
+    if not m:
+        return None, None
+    return (int(m.group(1)) if m.group(1) else None), (int(m.group(2)) if m.group(2) else None)
+
+
+def ident_caption(message, classified, ident):
+    """Step 1 of the /autosort caption. -> (caption, facts), or (None, None) when nothing can be built (then the caller keeps the
+    file-name caption of autosort_caption()). `ident` is info["ident"] of plugins/classify.py: {kind, title, year, source, id
+    [, season]}. The title and year are the CANONICAL ones of the identified TMDB / AniList record; the quality tags (resolution,
+    source, platform, codec, HDR, language, audio, subs) come from the name; the season / episode come from the file name first,
+    then - for series and anime only, NEVER for a movie - from the caption lines. A year the record lacks is taken from the name.
+    Plain text (no bold, no links), HTML-escaped. facts = {kind, title, year, ep, season, episode} is what Step 2 checks the
+    caption against. Never raises."""
+    try:
+        if not CAPTION_FROM_IDENT or not ident or not classified:
+            return None, None
+        base = classified[:-6] if classified.endswith("_files") else classified
+        if base not in _IDENT_KINDS or ident.get("kind") != base:
+            return None, None
+        title = re.sub(r"\s+", " ", str(ident.get("title") or "")).strip()
+        if len(re.findall(r"\w", title)) < 2:
+            return None, None
+        episodic = base != "movie"
+        names = []
+        fn = get_filename(message)
+        if fn:
+            names.append(fn)                                          # 1. the file name
+        caption = getattr(message, "caption", None)
+        if caption:                                                   # 2. the caption lines
+            for ln in str(caption).splitlines():
+                t = _plain_text(ln)
+                if len(re.findall(r"\w", t)) >= 3 and not _is_label_or_promo(t):
+                    names.append(t)
+        parses = [p for p in (_parse_media_name(n, episodic) for n in names[:13]) if p]
+        if not parses:
+            return None, None
+        tags_src = max(enumerate(parses), key=lambda ip: (len(ip[1]["tags"]), -ip[0]))[1]   # most tags, the earlier name wins a tie
+        year = ident.get("year") if isinstance(ident.get("year"), int) else None
+        if year is None:
+            year = next((int(p["year"]) for p in parses if p["year"]), None)
+        ep = None
+        if episodic:
+            ep = next((p["ep"] for p in parses if p["ep"]), None)
+            if ep and re.fullmatch(r"E\d+", ep) and isinstance(ident.get("season"), int):
+                ep = f"S{ident['season']:02d}{ep}"                      # anime: a bare "E05" + the season the AniList title names
+        head = title + (f" ({year})" if year else "") + (f" {ep}" if ep else "")
+        out = _html.escape(head, quote=False)
+        if tags_src["tags"]:
+            out += "\n" + _html.escape(" • ".join(tags_src["tags"]), quote=False)
+        season, episode = _ep_numbers(ep)
+        return out, {"kind": base, "title": title, "year": year, "ep": ep, "season": season, "episode": episode}
+    except Exception:
+        return None, None
+
+
+def parse_edited_caption(caption):
+    """Step 2 helper: read the FIRST line of an edited caption (ident_caption() output) back with the same parser the caption
+    rules use -> {"year": int | None, "ep": str | None, "season": int | None, "episode": int | None, "episodic": bool}, or None
+    when it cannot be read. "episodic" = the caption carries an episode / season marker (so it is not a movie caption)."""
+    try:
+        first = _html.unescape(str(caption or "").split("\n", 1)[0])
+        p = _parse_media_name(first, True)
+        if not p:
+            return None
+        season, episode = _ep_numbers(p["ep"])
+        return {"year": int(p["year"]) if p["year"] else None, "ep": p["ep"], "season": season, "episode": episode,
+                "episodic": bool(p["ep"])}
+    except Exception:
+        return None
 
 
 # ============================================================

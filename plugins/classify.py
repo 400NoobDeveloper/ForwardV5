@@ -147,6 +147,29 @@ Steps for a video file:
         neutral answer = the old behaviour), and a name whose deep parse raises is parsed again with every round-2
         switch off (_parse_name_safe()). Nothing is ever dropped: a file nothing identifies goes to Other.
 
+ 15. /autosort only, round 3 (every rule has its own env switch, default on; 0 = the old behaviour; an exception in a new
+     rule logs one WARNING and falls back to the old behaviour for that file):
+     a. A file is a VIDEO by what it is, not only by its extension (DEEP_VIDEO_BY_MIME): a native Telegram video, a
+        document whose MIME type is video/*, a container missing from VIDEO_EXTENSIONS (.mpg .3gp .m2ts ...) and a
+        document with no real extension whose name is a release name ("Title.2019.1080p.BluRay.x264-GRP": the "extension"
+        is ".x264-GRP") are identified; before they went to Other as "other_type".
+     b. A generic file name ("VID_2023...", "video_12", "Telegram Video") reads the wide caption window, like a truncated
+        one (GENERIC_NAME_USELESS).
+     c. A caption line with a year or SxxExx plus a quality tag is a candidate name wherever it sits in the caption, not
+        only when it is one of the first two usable lines (CAPTION_SIGNAL_LINES).
+     d. A season / episode that appears only in the CAPTION never turns a movie file name (year + quality, no marker)
+        into a TV-only search (CAPTION_EP_SERIES_ONLY).
+     e. Strong course names (numbered lecture, "Lecture 5", "class 12 chapter 3") without a year / release tag are
+        education BEFORE any TMDB / AniList call (EDU_PRECHECK). Soft course words stay candidates (a source that knows
+        the show still wins).
+     f. info["ident"] is the record of what was identified (kind, canonical TMDB / AniList title, year, source, id).
+        handlers/autosort.py rebuilds the caption from it and checks the edited caption parses back to the same
+        type / season / episode / year (IDENT_RECORD).
+     g. Final check before a file stays in Other (FINAL_PASS): audio / pdf / image / archive / video signals by MIME and
+        cleaned extension, then ONE more run of the deep pipeline over a wider candidate set (every caption line, the
+        classic guessit titles, transliteration variants), cached per title. info["final_pass"] says what was tried;
+        info["other_reason"] / ["other_detail"] stay precise.
+
 Non-video routing (pdf / image / audio / files / other) is extension
 based, exactly as before.
 
@@ -266,6 +289,17 @@ USE_ANIME_OFFLINE_DB = _env_on("USE_ANIME_OFFLINE_DB")         # 3.7  manami ani
 USE_PTT_PARSER = _env_on("USE_PTT_PARSER", False)              # 3.7  optional second parser ("parsett", import name PTT); needs Python 3.11+
 CAPTION_LINES_WHEN_NAME_USELESS = _env_count("CAPTION_LINES_WHEN_NAME_USELESS", 6, 2, 12)   # caption lines read when the file name is truncated
 
+# ---- round 3 (identification coverage, Step 1 / Step 2 records, the final check before Other). Same convention as round 2:
+# default on, 0 / false / no / off = the OLD behaviour; a helper that raises logs ONE WARNING (see _new_rule) and answers
+# its neutral value. All of them are /autosort only (deep mode): /fwd never sees them.
+DEEP_VIDEO_BY_MIME = _env_on("DEEP_VIDEO_BY_MIME")             # 15a  video by MIME type / known container / extension-less release name
+GENERIC_NAME_USELESS = _env_on("GENERIC_NAME_USELESS")         # 15b  "VID_2023", "video_12", "Telegram Video" read the wide caption window
+CAPTION_SIGNAL_LINES = _env_on("CAPTION_SIGNAL_LINES")         # 15c  a caption line with year / SxxExx + quality is a candidate wherever it sits
+CAPTION_EP_SERIES_ONLY = _env_on("CAPTION_EP_SERIES_ONLY")     # 15d  a caption-only season / episode never makes a movie file name TV-only
+EDU_PRECHECK = _env_on("EDU_PRECHECK")                         # 15e  strong course names are education before any TMDB / AniList call
+IDENT_RECORD = _env_on("IDENT_RECORD")                         # 15f  info["ident"]: canonical title / year of the identified record
+FINAL_PASS = _env_on("FINAL_PASS")                             # 15g  one full re-check before a file stays in Other
+
 CATEGORIES = (
     "anime", "anime_files",
     "series", "series_files",
@@ -296,6 +330,8 @@ AUDIO_EXTENSIONS = {".mp3", ".flac", ".m4a", ".wav", ".ogg", ".opus", ".aac"}
 # Audio instead of Other; /fwd and its category filters keep AUDIO_EXTENSIONS exactly as before.
 DEEP_AUDIO_EXTENSIONS = AUDIO_EXTENSIONS | {".ac3", ".eac3", ".dts", ".mka", ".aiff", ".wma", ".amr", ".ape", ".wv", ".m4b"}
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".webm", ".mov", ".wmv", ".ts", ".m4v", ".flv"}
+# Only /autosort (DEEP_VIDEO_BY_MIME) also knows these containers as video; /fwd keeps VIDEO_EXTENSIONS exactly as before.
+_DEEP_EXTRA_VIDEO_EXTENSIONS = {".mpg", ".mpeg", ".3gp", ".m2ts", ".mts", ".vob", ".divx", ".ogv", ".rmvb", ".asf", ".f4v", ".ogm"}
 # Archives. Only /autosort (classify_async(deep_series=True)) files them under "files"
 # ("Files (Unidentified)"); everywhere else they stay "other" exactly as before. Split-archive
 # forms (.7z.001, .part1.rar, .r00) are already caught by _SPLIT_PART_PATTERNS below.
@@ -702,8 +738,10 @@ def nsfw_category(message, mapping=None):
     return _nsfw_target(message, mapping)
 
 
-def _candidate_names(message, max_lines: int = 2) -> list:
-    """Filename first, then up to `max_lines` (default two) usable caption lines."""
+def _candidate_names(message, max_lines: int = 2, signal: bool = False) -> list:
+    """Filename first, then up to `max_lines` (default two) usable caption lines.
+    signal=True (/autosort's deep mode, CAPTION_SIGNAL_LINES): up to two further caption lines that carry a clear release
+    signal are appended (see _signal_lines()); everything else is unchanged."""
     names = []
     fn = get_filename(message)
     if fn:
@@ -721,7 +759,35 @@ def _candidate_names(message, max_lines: int = 2) -> list:
         added += 1
         if added >= max_lines:
             break
+    if signal and CAPTION_SIGNAL_LINES:
+        names += _signal_lines(caption, names)
     return names
+
+
+@_new_rule(lambda *a, **k: [])
+def _signal_lines(caption: str, have: list) -> list:
+    """Up to two caption lines (of the first 14) that are not candidates yet and carry a clear release signal: a year or an
+    SxxExx marker TOGETHER with a quality / source / codec tag. Channel posts often open with promo lines and put the real
+    name on line 3 or 4; before, only the first two usable lines were ever looked at. Pure string work."""
+    out = []
+    seen = {_norm_cmp(_clean_name(x)) for x in have}
+    for line in (caption or "").splitlines()[:14]:
+        line = _CAPTION_LABEL_RE.sub("", line.strip())
+        if not line or _CAPTION_META_RE.match(line) or line in have:
+            continue
+        cleaned = _clean_name(line)
+        if len(re.findall(r"\w", cleaned)) < 2:
+            continue
+        key = _norm_cmp(cleaned)
+        if key in seen:
+            continue
+        mv = _movie_info(line)
+        if mv["usable"] and mv["tech"] and (mv["year"] or _EP_MARKER_RE.search(cleaned)):
+            out.append(line)
+            seen.add(key)
+            if len(out) >= 2:
+                break
+    return out
 
 
 @_new_rule(lambda *a, **k: False)
@@ -729,6 +795,85 @@ def _name_is_useless(filename) -> bool:
     """A truncated / empty file name ("v .mp4"): fewer than 4 letters or digits before the extension."""
     stem = os.path.splitext(filename or "")[0]
     return len(re.findall(r"[^\W_]", stem)) < 4
+
+
+# Camera / downloader / messenger names carry no title ("VID_20231105_123456", "video_12", "Telegram Video", "IMG-0001-WA0001").
+_GENERIC_NAME_WORDS = {
+    "vid", "video", "videos", "img", "image", "file", "files", "document", "doc", "media", "movie", "clip", "screenrecord",
+    "screenrecording", "screen", "recording", "record", "recorded", "telegram", "whatsapp", "wa", "mov", "mvi", "dsc", "pxl",
+    "download", "downloaded", "unknown", "untitled", "new", "copy", "final", "output", "out", "tmp", "temp", "reel", "reels",
+    "insta", "instagram", "fb", "facebook", "vlc", "trim", "edited", "edit", "pic", "photo", "mp", "mp4", "mkv",
+}
+
+
+@_new_rule(lambda *a, **k: False)
+def _name_is_generic(filename) -> bool:
+    """GENERIC_NAME_USELESS: the file name is only generic words and numbers ("VID_2023", "video 12", "Telegram Video"), so the
+    title can only be in the caption. Like a truncated name it makes every caption line a candidate. An empty stem is no
+    news (the caller handles a missing name)."""
+    if not GENERIC_NAME_USELESS or not filename:
+        return False
+    stem = os.path.splitext(filename)[0]
+    words = re.findall(r"[A-Za-z]+", stem)
+    if not words:
+        return bool(re.search(r"\d", stem))                  # digits only ("20231105_123456")
+    return all(w.lower() in _GENERIC_NAME_WORDS for w in words)
+
+
+def _doc_video_mime(message) -> bool:
+    """A DOCUMENT whose MIME type says video/* (a Telegram video sent \"as a file\")."""
+    doc = getattr(message, "document", None)
+    mime = getattr(doc, "mime_type", None) if doc is not None else None
+    return isinstance(mime, str) and mime.lower().startswith("video/")
+
+
+_KNOWN_EXTS = (PDF_EXTENSIONS | IMAGE_EXTENSIONS | DEEP_AUDIO_EXTENSIONS | VIDEO_EXTENSIONS | _DEEP_EXTRA_VIDEO_EXTENSIONS
+               | ARCHIVE_EXTENSIONS | {".srt", ".ass", ".ssa", ".vtt", ".sub", ".txt", ".nfo", ".apk", ".exe", ".epub", ".mobi",
+                                       ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".csv", ".json", ".xml", ".html"})
+
+
+def _fake_ext(ext: str) -> bool:
+    """True when os.path.splitext() found no real extension: the name is empty-tailed ("Title (2019) 1080p WEB-DL") or the
+    last dotted piece is a release token ("Title.2019.1080p.BluRay.x264-GRP" -> ".x264-GRP", "...WEB-DL" -> ".WEB-DL")."""
+    if not ext:
+        return True
+    if ext in _KNOWN_EXTS:
+        return False
+    body = ext[1:]
+    return len(body) > 6 or "-" in body or body.isdigit() or bool(_MOVIE_STRONG_RE.match(body))
+
+
+@_new_rule(lambda *a, **k: False)
+def _release_signal(name: str) -> bool:
+    """The name is clearly a release name: a year or an episode marker TOGETHER with a quality / source / codec tag."""
+    mv = _movie_info(name)
+    return bool(mv["usable"] and mv["tech"] and (mv["year"] or _EP_MARKER_RE.search(name or "")))
+
+
+@_new_rule(lambda *a, **k: False)
+def _deep_is_video(message, filename: str, ext: str) -> bool:
+    """DEEP_VIDEO_BY_MIME (/autosort only). True when a file the extension test calls "not a video" really is one, so it is
+    identified instead of landing in Other as "other_type":
+      * a native Telegram video, whatever its file name says;
+      * a document whose MIME type is video/*;
+      * a container missing from VIDEO_EXTENSIONS (.mpg .mpeg .3gp .m2ts ...);
+      * a document with no real extension whose name is a release name (year / SxxExx + quality tags).
+    Normal video extensions and split archive names (".mkv.001", ".r00") keep their old routing (False here)."""
+    if not DEEP_VIDEO_BY_MIME or ext in VIDEO_EXTENSIONS or ext in PDF_EXTENSIONS or ext in IMAGE_EXTENSIONS:
+        return False
+    if _is_split_part(filename):
+        return False
+    if ext in _DEEP_EXTRA_VIDEO_EXTENSIONS:
+        return True
+    videoish = getattr(message, "video", None) is not None or _doc_video_mime(message)
+    if ext in DEEP_AUDIO_EXTENSIONS:
+        # "Title.2019.720p.HDRip.AAC" has no extension, ".AAC" is its last tag: only a release name sent as a video says so
+        return bool(videoish and _release_signal(filename))
+    if ext in _KNOWN_EXTS:
+        return False                                  # archives, subtitles, text / office files: the extension's verdict stands
+    if videoish:
+        return True
+    return bool(getattr(message, "document", None) is not None and _fake_ext(ext) and _release_signal(filename))
 
 
 # ============================================================
@@ -2147,16 +2292,22 @@ def _early_category(message, archives_as_files: bool = False):
     filename = get_filename(message)
     # deep (/autosort) only: a missing / truncated file name ("v .mp4") makes EVERY caption line a candidate
     # (up to CAPTION_LINES_WHEN_NAME_USELESS); a normal file name keeps the old two lines.
-    wide = CAPTION_LINES_WHEN_NAME_USELESS if (archives_as_files and _name_is_useless(filename)) else 2
+    wide = (CAPTION_LINES_WHEN_NAME_USELESS
+            if (archives_as_files and (_name_is_useless(filename) or _name_is_generic(filename))) else 2)
     if not filename:
         if getattr(message, "voice", None) or getattr(message, "audio", None):
             return "audio", [], False
         # Native video uploads often have no file_name; the title is
         # usually in the caption.
         if getattr(message, "video", None) is not None:
-            names = _candidate_names(message, wide)
+            names = _candidate_names(message, wide, archives_as_files)
             if names:
                 return None, names, False
+        # deep: a video sent as a DOCUMENT with no file name (MIME video/*): the title is in the caption as well
+        if archives_as_files and DEEP_VIDEO_BY_MIME and _doc_video_mime(message):
+            names = _candidate_names(message, wide, True)
+            if names:
+                return None, names, True
         return "other", [], False
 
     ext = os.path.splitext(filename)[1].lower()
@@ -2164,6 +2315,9 @@ def _early_category(message, archives_as_files: bool = False):
         return "pdf", [], False
     if ext in IMAGE_EXTENSIONS:
         return "image", [], False
+    if archives_as_files and _deep_is_video(message, filename, ext):
+        # deep: a video by MIME type / container / release name (see _deep_is_video); the "_files" variant is a document
+        return None, _candidate_names(message, wide, True), getattr(message, "document", None) is not None
     if ext in (DEEP_AUDIO_EXTENSIONS if archives_as_files else AUDIO_EXTENSIONS):
         return "audio", [], False
 
@@ -2179,7 +2333,7 @@ def _early_category(message, archives_as_files: bool = False):
     # A video-extension file: "_files" variant only if it arrived as a
     # genuine document upload (see /diagnose_media).
     is_files_variant = getattr(message, "document", None) is not None
-    return None, _candidate_names(message, wide), is_files_variant
+    return None, _candidate_names(message, wide, archives_as_files), is_files_variant
 
 
 def _other_note(info, reason: str, detail: str = "") -> None:
@@ -2938,6 +3092,22 @@ async def _tmdb_identify_core(session, tmdb_key: str, p: dict, anime_mode: bool 
     return _Ident("error" if errored else "none", None, False)
 
 
+@_new_rule(lambda *a, **k: None)
+def _note_tmdb_match(info, match: dict, media: str) -> None:
+    """IDENT_RECORD: info["tmdb_match"] = the canonical title / year of the TMDB entry the file matched (read by
+    _build_ident()). Never changes a verdict."""
+    if info is None or not IDENT_RECORD or not isinstance(match, dict):
+        return
+    is_movie = media == "movie"
+    info["tmdb_match"] = {
+        "media": "movie" if is_movie else "tv", "id": match.get("id"),
+        "title": (match.get("title") if is_movie else match.get("name")) or match.get("name") or match.get("title"),
+        "original": match.get("original_title") if is_movie else match.get("original_name"),
+        "year": _year_of(match.get("release_date") if is_movie else match.get("first_air_date")),
+        "animated": TMDB_ANIMATION_GENRE_ID in (match.get("genre_ids") or []),
+    }
+
+
 async def _tmdb_identify(session, tmdb_key: str, p: dict, use_anilist: bool = False, anilist_key: str = "", info=None,
                          anime_mode: bool = False):
     """-> ("found", kind) | ("none", None) | ("error", None).
@@ -2957,6 +3127,8 @@ async def _tmdb_identify(session, tmdb_key: str, p: dict, use_anilist: bool = Fa
             _anime_tmdb_fields(info, animated, ident.match.get("original_language"),
                                ",".join(ident.match.get("origin_country") or []), ident.anime_source,
                                ident.anime_why, ident.animelist)
+        if ident.match is not None:
+            _note_tmdb_match(info, ident.match, ident.media_type)
     if not use_anilist:
         if anime_mode and USE_ANIME_OFFLINE_DB and (status != "found" or (kind in ("series", "movie") and animated)):
             # AniList is OFF and TMDB is unsure: the anime-offline-database may know it (exact title + year, never raises)
@@ -3278,7 +3450,339 @@ async def tpdb_category(message, mapping, key: str, session=None):
     return target if await tpdb_known(message, key, session) else None
 
 
+# ============================================================
+# Round 3 helpers (/autosort deep mode): caption-only markers, education pre-check, the final check before Other,
+# the identification record. Every helper is wrapped (_new_rule / try): an exception = one WARNING + the old behaviour.
+# ============================================================
+def _rule_warn(name: str, e: Exception) -> None:
+    """ONE WARNING (per helper, at most once a minute) for a round-3 step that raised outside a _new_rule helper."""
+    now = time.monotonic()
+    if now - _RULE_WARNED.get(name, -1e9) > 60:
+        _RULE_WARNED[name] = now
+        logger.warning("autosort: new rule %s failed (%s: %s) - old behaviour for this file", name, type(e).__name__, e)
+
+
+@_new_rule(lambda *a, **k: False)
+def _caption_only_marker(parsed: list) -> bool:
+    """CAPTION_EP_SERIES_ONLY: True when the FILE NAME's parse is clearly a movie (a year and quality tags, no season /
+    episode marker) and a season / episode marker exists only in caption lines."""
+    if not CAPTION_EP_SERIES_ONLY:
+        return False
+    fn = [pp for pp in parsed if pp.get("from_name")]
+    if not fn or any(pp.get("series_like") for pp in fn):
+        return False
+    return all(pp.get("year") and (pp.get("movie") or {}).get("tech") and not pp.get("is_episode")
+               and not pp.get("anime_tag") for pp in fn)
+
+
+def _propagate_series_like(parsed: list, deep: bool = False) -> None:
+    """If ANY name of the file says series (Episode N / SxxExx / Season N), every name is looked up as TV only. Deep exception:
+    when the marker is only in a caption line and the file name is a movie name, the file name stays a movie search (movie
+    first; the caption lines are still searched as TV) - season / episode text in a CAPTION never makes a movie a series."""
+    if not any(pp.get("series_like") for pp in parsed):
+        return
+    if deep and _caption_only_marker(parsed):
+        for pp in parsed:
+            if not pp.get("from_name"):
+                pp["series_like"] = True
+        return
+    for pp in parsed:
+        pp["series_like"] = True
+
+
+@_new_rule(lambda *a, **k: False)
+def _edu_precheck(message, names, parsed) -> bool:
+    """EDU_PRECHECK: STRONG course naming (numbered lecture "5.1.3 Intro", "Lecture 5", "class 12 chapter 3", a course platform)
+    in a name with no year, no release tag and no episode marker is education - no source can confirm such a name anyway, so
+    nothing is sent to TMDB / AniList. Soft course words, release names and episodes are NOT decided here."""
+    if not EDU_PRECHECK or not parsed:
+        return False
+    if any(pp.get("has_movie_signal") or pp.get("strong_episode") or pp.get("year") or pp.get("extra") for pp in parsed):
+        return False
+    if is_nsfw(message) or _extra_hit(parsed, names):
+        return False
+    return _edu_level(names) == 2
+
+
+_IDENT_CACHE: "OrderedDict" = OrderedDict()     # final-pass verdict per title: (normalized title, year, is_files) -> dict
+_FINAL_SKIP_REASONS = {"extra", "education_vetoed", "nsfw_unmapped"}      # deliberate "other"s: not re-checked
+_ARCHIVE_MIMES = ("application/zip", "application/x-zip", "application/x-zip-compressed", "application/x-rar",
+                  "application/vnd.rar", "application/x-rar-compressed", "application/x-7z-compressed", "application/x-tar",
+                  "application/gzip", "application/x-gzip", "application/x-bzip2", "application/x-xz")
+
+
+def _mime_of(message) -> str:
+    for attr in ("document", "video", "audio", "animation", "voice"):
+        media = getattr(message, attr, None)
+        mt = getattr(media, "mime_type", None) if media is not None else None
+        if isinstance(mt, str) and mt:
+            return mt.lower()
+    return ""
+
+
+@_new_rule(lambda *a, **k: None)
+def _signal_recheck(message):
+    """pdf | image | audio | files | video | None: what the cleaned extension (trailing dots / spaces ignored) and the MIME type
+    say the file is. The last look before a file stays in Other."""
+    mime = _mime_of(message)
+    name = (get_filename(message) or "").strip().rstrip(". _")
+    ext = os.path.splitext(name)[1].lower()
+    if ext in PDF_EXTENSIONS or mime == "application/pdf":
+        return "pdf"
+    if ext in IMAGE_EXTENSIONS or mime.startswith("image/"):
+        return "image"
+    if ext in DEEP_AUDIO_EXTENSIONS or mime.startswith("audio/"):
+        return "audio"
+    if ext in ARCHIVE_EXTENSIONS or mime in _ARCHIVE_MIMES or (name and _is_split_part(name)):
+        return "files"
+    if ext in VIDEO_EXTENSIONS or ext in _DEEP_EXTRA_VIDEO_EXTENSIONS:
+        return "video"
+    if (mime.startswith("video/") or getattr(message, "video", None) is not None) and ext not in _KNOWN_EXTS:
+        return "video"                                # a real non-video extension (".srt", ".txt" ...) is never a video by MIME
+    return None
+
+
+def _clear_other(info: dict) -> None:
+    info.pop("other_reason", None)
+    info.pop("other_detail", None)
+
+
+@_new_rule(lambda *a, **k: [])
+def _widen_names(message, names0: list) -> list:
+    """The candidate names of the final check: the ones already tried, then EVERY usable caption line (up to 12) and the
+    caption lines with a clear release signal, the file name first. The split-part suffix is removed by the parser itself."""
+    out = []
+    fn = get_filename(message)
+    for n in ([fn] if fn else []) + list(names0) + _candidate_names(message, 12, True):
+        if n and n not in out:
+            out.append(n)
+    return out[:16]
+
+
+def _widen_parse(raw: str, p: dict) -> None:
+    """FINAL_PASS: one parsed name gets more title candidates - the CLASSIC (guessit-only) parse of the same name, and for a
+    film with a year the joined / split / transliterated spellings. The deep clean-up can mangle a title the classic parse
+    reads right (and the other way round), so both are tried."""
+    p["final_pass"] = True
+    try:
+        classic = _parse_name(raw, deep=False)
+    except Exception:
+        classic = None
+    if classic:
+        have = {_norm_cmp(t) for t in p["titles"]}
+        for t in classic.get("titles") or []:
+            k = _norm_cmp(t)
+            if k and k not in have and not _generic_title(t):
+                p["titles"].append(t)
+                have.add(k)
+        p["titles"] = p["titles"][:6]
+        keep = {c["title"]: c for c in p.get("candidates") or []}
+        p["candidates"] = [keep.get(t) or {"title": t, "dropped": 0, "kind": "classic"} for t in p["titles"]]
+    mv = p.get("movie")
+    if mv and mv.get("title") and p.get("year"):
+        mv["variants"] = list(dict.fromkeys(list(mv.get("variants") or []) + _title_variants(mv["title"], translit=True)))
+
+
+async def _final_check(message, category, session, tmdb_key, use_anilist, anilist_key, openai_key, info, anime_mode) -> str:
+    """FINAL_PASS: the last look before a file stays in Other. Skipped for deliberate Others (sample / trailer, course words
+    with a known show, adult content). Otherwise:
+      1. audio / pdf / image / archive / video once more, by the cleaned extension and the MIME type;
+      2. ONE more run of the deep pipeline (_deep_series) over a wider candidate set: the file name, EVERY caption line, the
+         lines with a release signal, the classic guessit titles, transliteration variants - TMDB, AniList, TVmaze, Wikidata,
+         IMDb / OMDb, the anime lists, exactly the sources the first run uses (nothing is called twice: every search, show
+         and film verdict is cached per title);
+      3. education once more when no name could be parsed at all.
+    -> the (possibly new) category; on success info[...] is replaced by the second run's details and other_reason is
+    cleared; otherwise other_reason / other_detail are made as precise as possible and info["final_pass"] says what was tried.
+    A TMDB failure during the extra lookups is no evidence: the first verdict stands (it never becomes tmdb_error)."""
+    if category != "other" or not FINAL_PASS:
+        return category
+    reason = info.get("other_reason")
+    if reason in _FINAL_SKIP_REASONS:
+        return category
+    fp = info.setdefault("final_pass", {})
+    fp.update(checked=True, names=0, summary="")
+    ctx = info.get("ctx") or {}
+    names0, is_files = list(ctx.get("names") or []), bool(ctx.get("is_files"))
+    if is_nsfw(message):
+        fp["summary"] = "adult-content keywords: no lookups"
+        return category
+
+    sig = _signal_recheck(message)
+    if sig in ("pdf", "image", "audio", "files"):
+        _clear_other(info)
+        fp.update(rescued=sig, summary=f"extension / MIME type say {sig}")
+        logger.info("autosort final-pass: msg=%s name=%r other -> %s (extension / MIME type)",
+                    getattr(message, "id", "-"), (get_filename(message) or "-")[:60], sig)
+        return sig
+    if sig == "video" and not names0:
+        names0 = _candidate_names(message, CAPTION_LINES_WHEN_NAME_USELESS, True)
+        is_files = getattr(message, "document", None) is not None
+    if not names0:
+        fp["summary"] = "no candidate name (not a video, or no file name and no usable caption)"
+        return category
+    if not tmdb_key or aiohttp is None or guessit is None:
+        fp["summary"] = "no TMDB key / HTTP client / guessit: nothing to look up"
+        return category
+
+    names2 = _widen_names(message, names0)
+    has_fn = bool(get_filename(message))
+    parsed2 = []
+    for i, raw in enumerate(names2):
+        p = _parse_name_safe(raw, check_extra=(i == 0), deep=True, anime=anime_mode)
+        if p:
+            p["from_name"] = bool(i == 0 and has_fn)
+            _widen_parse(raw, p)
+            parsed2.append(p)
+    fp["names"] = len(names2)
+    if not parsed2:
+        if _edu_level(names2) >= 1:
+            _clear_other(info)
+            fp.update(rescued="education", summary=f"no title in {len(names2)} names, course words")
+            return f"education_files" if is_files else "education"
+        info["other_reason"], info["other_detail"] = "unparseable", f"no usable title in any of {len(names2)} candidate names"
+        fp["summary"] = info["other_detail"]
+        return category
+    if parsed2[0].get("extra"):
+        fp["summary"] = "sample / trailer / promo in the name"
+        return category
+    _propagate_series_like(parsed2, True)
+    titles = [t for pp in parsed2 for t in pp["titles"]]
+    fp["titles"] = len(set(_norm_cmp(t) for t in titles))
+
+    key = (_norm_cmp(parsed2[0]["titles"][0]), parsed2[0].get("year") or next((pp.get("year") for pp in parsed2 if pp.get("year")), None),
+           is_files, anime_mode)
+    hit = _IDENT_CACHE.get(key)
+    if hit is not None:                                       # the same title was already re-checked in this run
+        _IDENT_CACHE.move_to_end(key)
+        if hit["category"] == "other":
+            info["other_reason"], info["other_detail"] = hit["reason"], hit["detail"]
+            fp["summary"] = hit["fp"] + " (cached verdict)"
+            return category
+        for k, v in hit["info"].items():
+            info[k] = v
+        _clear_other(info)
+        fp.update(rescued=hit["category"], summary=hit["fp"] + " (cached verdict)")
+        return hit["category"]
+
+    owns = session is None
+    if owns:
+        session = aiohttp.ClientSession()
+    info2: dict = {}
+    try:
+        cat2 = await _deep_series(message, names2, parsed2, is_files, session, tmdb_key, use_anilist, anilist_key,
+                                  openai_key, info2, anime_mode)
+    finally:
+        if owns:
+            await session.close()
+    summary = f"{len(names2)} names, {fp['titles']} titles, sources: TMDB" + (" + AniList" if use_anilist else "") + " + fallbacks"
+    base = cat2[:-6] if isinstance(cat2, str) and cat2.endswith("_files") else cat2
+    if base in ("movie", "series", "anime", "education"):
+        for k in ("tmdb_id", "tmdb_media", "tmdb_match", "series", "anime", "movie"):
+            if k in info2:
+                info[k] = info2[k]
+        _clear_other(info)
+        fp.update(rescued=cat2, summary=summary)
+        if len(_IDENT_CACHE) >= _CACHE_MAX:
+            _IDENT_CACHE.popitem(last=False)
+        _IDENT_CACHE[key] = {"category": cat2, "fp": summary,
+                             "info": {k: info2[k] for k in ("tmdb_id", "tmdb_media", "tmdb_match", "series", "anime", "movie") if k in info2}}
+        logger.info("autosort final-pass: msg=%s name=%r other(%s) -> %s (%s)", getattr(message, "id", "-"),
+                    (names2[0] or "-")[:60], reason, cat2, summary)
+        return cat2
+    if cat2 == TMDB_UNAVAILABLE:
+        fp["summary"] = summary + "; TMDB failed on the extra lookups, first verdict kept"
+        return category
+    r2, d2 = info2.get("other_reason"), info2.get("other_detail")
+    if r2 and reason in (None, "unidentified"):
+        info["other_reason"], info["other_detail"] = r2, d2 or "-"        # searched and nothing matched beats "no reason"
+    fp["summary"] = summary
+    if r2 == "not_found":
+        if len(_IDENT_CACHE) >= _CACHE_MAX:
+            _IDENT_CACHE.popitem(last=False)
+        _IDENT_CACHE[key] = {"category": "other", "reason": info.get("other_reason") or r2,
+                             "detail": info.get("other_detail") or d2 or "-", "fp": summary}
+    logger.info("autosort final-pass: msg=%s name=%r stays other (%s): %s", getattr(message, "id", "-"),
+                (names2[0] or "-")[:60], info.get("other_reason"), summary)
+    return category
+
+
+@_new_rule(lambda *a, **k: None)
+def _build_ident(info: dict, category: str):
+    """IDENT_RECORD: info["ident"] = {kind, title, year, source, id} for a file classified movie / series / anime (+ "_files"),
+    from the record the identification found - never from the raw file name:
+      movie   TMDB title + release year (or the film the IMDb / variant search found)
+      series  the TMDB / TVmaze / Wikidata show title + first-air year
+      anime   AniList / Jikan title (English, falling back to romaji; trailing "2nd Season" words removed, the season goes
+              into SxxExx) + the entry's year; TMDB's name when only TMDB knew it
+    No record (the title was proven another way - episode marker alone, Wikidata only, OpenAI ...): no info["ident"], and the
+    caption builder keeps today's file-name caption."""
+    info.pop("ident", None)
+    if not IDENT_RECORD:
+        return None
+    base = category[:-6] if category.endswith("_files") else category
+    if base not in ("movie", "series", "anime"):
+        return None
+    tm = info.get("tmdb_match") or {}
+    title = year = source = sid = season_hint = None
+    if base == "anime":
+        a = info.get("anime") or {}
+        t = a.get("title_en") or a.get("title_romaji")
+        if t:
+            base_t, season_hint, _part = _strip_season_words(t)           # "X 2nd Season" -> "X", season 2
+            title, year = base_t or t, a.get("media_year")
+            source, sid = a.get("source") or "anilist", a.get("anilist_id") or a.get("mal_id")
+        elif tm.get("title"):
+            title, year, source, sid = tm["title"], tm.get("year"), "tmdb", tm.get("id")
+    elif base == "series":
+        canon = (info.get("series") or {}).get("canon") or {}
+        if canon.get("title"):
+            title, year, source, sid = canon["title"], canon.get("year"), canon.get("source") or "tmdb", canon.get("id")
+        elif tm.get("media") == "tv" and tm.get("title"):
+            title, year, source, sid = tm["title"], tm.get("year"), "tmdb", tm.get("id")
+    else:
+        if tm.get("media") == "movie" and tm.get("title"):
+            title, year, source, sid = tm["title"], tm.get("year"), "tmdb", tm.get("id")
+        else:
+            mv = info.get("movie") or {}
+            if mv.get("matched") and mv.get("source"):
+                title, year, source, sid = mv["matched"], mv.get("matched_year"), mv["source"], mv.get("tmdb_id") or mv.get("imdb_id")
+    if not title or not str(title).strip():
+        return None
+    info["ident"] = {"kind": base, "title": str(title).strip(), "year": year if isinstance(year, int) else None,
+                     "source": source, "id": sid}
+    if base == "anime" and isinstance(season_hint, int):
+        info["ident"]["season"] = season_hint
+    return info["ident"]
+
+
 async def classify_async(message, session=None, tmdb_key: str = "", use_anilist: bool = False, anilist_key: str = "", openai_key: str = "", info=None, deep_series: bool = False, deep_anime: bool = False) -> str:
+    """Category for forwarding - see _classify_async_main() for the full description.
+
+    deep_series=False (/fwd, matches_async): exactly _classify_async_main(), nothing else runs.
+    deep_series=True (/autosort), after the main classification:
+      * FINAL_PASS: a file that would stay in "other" gets ONE more full check (see _final_check());
+      * IDENT_RECORD: info["ident"] = the identified record (kind, canonical title, year, source, id), see _build_ident().
+    Both are wrapped: an exception logs one WARNING and the main answer stands."""
+    if not deep_series:
+        return await _classify_async_main(message, session, tmdb_key, use_anilist, anilist_key, openai_key, info,
+                                          deep_series, deep_anime)
+    if info is None:
+        info = {}
+    category = await _classify_async_main(message, session, tmdb_key, use_anilist, anilist_key, openai_key, info,
+                                          deep_series, deep_anime)
+    try:
+        category = await _final_check(message, category, session, tmdb_key or ENV_TMDB_API_KEY, use_anilist, anilist_key,
+                                      openai_key, info, bool(deep_anime and deep_series))
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        _rule_warn("_final_check", e)
+    _build_ident(info, category)
+    return category
+
+
+async def _classify_async_main(message, session=None, tmdb_key: str = "", use_anilist: bool = False, anilist_key: str = "", openai_key: str = "", info=None, deep_series: bool = False, deep_anime: bool = False) -> str:
     """Category for forwarding. Videos are routed to movie / series /
     anime ONLY when TMDB confirms the title; otherwise "unidentified"
     (or "tmdb_error") is returned, which no channel maps to -> skipped.
@@ -3305,6 +3809,8 @@ async def classify_async(message, session=None, tmdb_key: str = "", use_anilist:
     See "/autosort deep ANIME identification" at the end of this file.
     """
     early, names, is_files = _early_category(message, archives_as_files=deep_series)
+    if info is not None and deep_series:
+        info.setdefault("ctx", {}).update(names=list(names), is_files=bool(is_files), early=early)   # read by _final_check()
     if early is not None:
         if early in ("other", "files"):
             _other_note(info, *_early_other_reason(message, early))
@@ -3312,7 +3818,10 @@ async def classify_async(message, session=None, tmdb_key: str = "", use_anilist:
 
     tmdb_key = tmdb_key or ENV_TMDB_API_KEY
     if not tmdb_key or aiohttp is None or guessit is None:
-        return classify(message)
+        guess = classify(message)
+        if guess == "other":
+            _other_note(info, "unidentified", "no TMDB key / HTTP client / guessit available: file-name guess only")
+        return guess
 
     def _finish(kind: str) -> str:
         return f"{kind}_files" if is_files else kind
@@ -3330,6 +3839,7 @@ async def classify_async(message, session=None, tmdb_key: str = "", use_anilist:
 
     anime_mode = bool(deep_anime and deep_series)
     parsed = []
+    has_fn = bool(get_filename(message))
     for i, raw in enumerate(names):
         # The first name (the file name, or - for native videos that have none -
         # the first caption line) is checked for sample / trailer / teaser ...
@@ -3337,6 +3847,7 @@ async def classify_async(message, session=None, tmdb_key: str = "", use_anilist:
         # "Movie (2025) Official Trailer" was matched to the movie on TMDB.
         p = _parse_name_safe(raw, check_extra=(i == 0), deep=deep_series, anime=anime_mode)
         if p:
+            p["from_name"] = bool(i == 0 and has_fn)          # this parse is the FILE NAME's (not a caption line's)
             parsed.append(p)
     if not parsed:
         _other_note(info, "unidentified", "no usable title in the name")
@@ -3348,13 +3859,14 @@ async def classify_async(message, session=None, tmdb_key: str = "", use_anilist:
                               "title": parsed[0].get("clean_title") or parsed[0]["titles"][0],
                               "language": parsed[0].get("language")}
         return "other"
-    if any(pp.get("series_like") for pp in parsed):
-        # One name says "Episode 5" / "S01E02" / "Season 2": look up ALL names of
-        # this file as TV only. Before, another name (a plain caption line without
-        # a marker) was still searched as a movie and could turn an episode into
-        # a movie that merely shares the show's title.
-        for pp in parsed:
-            pp["series_like"] = True
+    # One name says "Episode 5" / "S01E02" / "Season 2": look up ALL names of this file as TV only. Before, another name
+    # (a plain caption line without a marker) was still searched as a movie and could turn an episode into a movie that
+    # merely shares the show's title. Deep: a marker found ONLY in the caption does not do that to a file name that is
+    # clearly a movie (year + quality tags, no marker) - see _propagate_series_like().
+    _propagate_series_like(parsed, deep_series)
+    if deep_series and _edu_precheck(message, names, parsed):
+        # EDU_PRECHECK: a strong course name with no year / release tag is education - decided before any TMDB / AniList call
+        return _finish("education")
 
     owns_session = session is None
     if owns_session:
@@ -3955,7 +4467,8 @@ def _show_year(p: dict):
 
 def _show_key(p: dict):
     title = p.get("clean_title") or (p["titles"][0] if p.get("titles") else "")
-    return (_norm_cmp(title), p.get("language"), _show_year(p))
+    key = (_norm_cmp(title), p.get("language"), _show_year(p))
+    return key + ("final",) if p.get("final_pass") else key       # the final check (FINAL_PASS) caches its own verdicts
 
 
 def _show_get(p: dict, source: str):
@@ -4247,6 +4760,7 @@ async def _tmdb_tv_show(session, tmdb_key: str, p: dict, anime_mode: bool = Fals
         return ({"source": "tmdb", "id": mid, "verdict": "found", "kind": kind, "animated": animated,
                  "facts": facts, "ambiguous": ambiguous, "lang_ok": lang_ok, "cand": cand, "why": why,
                  "cacheable": cacheable, "anime_source": a_src if kind == "anime" else None, "animelist": a_list,
+                 "tmdb_title": chosen.get("name"), "tmdb_year": _year_of(chosen.get("first_air_date")),
                  "tmdb_lang": chosen.get("original_language"),
                  "tmdb_origin": ",".join(chosen.get("origin_country") or [])}, errored)
     if errored:
@@ -4272,6 +4786,9 @@ async def _deep_tmdb_tv(session, tmdb_key: str, p: dict, use_anilist: bool, anil
     why = ent.get("why", "") if found else ""
     if found and info is not None:
         info["tmdb_id"], info["tmdb_media"] = ent["id"], "tv"
+        if IDENT_RECORD and ent.get("tmdb_title"):
+            info["tmdb_match"] = {"media": "tv", "id": ent["id"], "title": ent.get("tmdb_title"), "original": None,
+                                  "year": ent.get("tmdb_year"), "animated": bool(ent.get("animated"))}
         if anime_mode:
             _anime_tmdb_fields(info, ent.get("animated"), ent.get("tmdb_lang"), ent.get("tmdb_origin"),
                                ent.get("anime_source"), ent.get("why") if kind == "anime" else None, ent.get("animelist"))
@@ -4973,7 +5490,8 @@ async def _movie_fallbacks(session, tmdb_key: str, p: dict, info: dict, anime_mo
             elif anime_mode:
                 ok, _src, _why, _lst = await _tmdb_anime_confirm(session, match, "movie", mid, animated)
                 kind = "anime" if ok else "movie"
-            return _store(kind, mid, {"source": source, "matched": match.get("title"), "tmdb_id": mid})
+            return _store(kind, mid, {"source": source, "matched": match.get("title"), "tmdb_id": mid,
+                                      "matched_year": _year_of(match.get("release_date"))})
 
         if year:
             match, err = await _tmdb_movie_variants(session, tmdb_key, p)
@@ -5446,6 +5964,12 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
             edu, nsfw, extra, movie_like, wikidata, lang_ok, ep_title, ambiguous)
         if ok and tvmaze and any(str(g).lower() == "anime" for g in tvmaze["genres"]):
             ok, reason = False, "TVmaze lists it as anime"
+        if ok and IDENT_RECORD:
+            for f in (tmdb, tvmaze, wikidata):          # IDENT_RECORD: the canonical show title / first year of the vouching source
+                if f and f.get("names"):
+                    sinfo["canon"] = {"title": f["names"][0], "year": f.get("first_year"),
+                                      "source": f.get("source") or source, "id": f.get("id")}
+                    break
         sinfo.update(
             candidate=bool(p.get("strong_episode") or p.get("is_episode") or p.get("series_like")
                            or tmdb or tvmaze or wikidata or openai),
@@ -6454,7 +6978,10 @@ def _anime_media_fields(media: dict, source: str = "anilist") -> dict:
     jikan = source == "jikan"
     return {"anilist_id": None if jikan else media.get("id"), "mal_id": media.get("id") if jikan else media.get("idMal"),
             "format": media.get("format"), "origin": None if jikan else media.get("countryOfOrigin"),
-            "matched": t.get("romaji") or t.get("english") or t.get("native")}
+            "matched": t.get("romaji") or t.get("english") or t.get("native"),
+            # IDENT_RECORD: the canonical names / year of the entry (the caption is rebuilt from them)
+            "title_en": t.get("english"), "title_romaji": t.get("romaji"),
+            "media_year": media.get("seasonYear") or ((media.get("startDate") or {}).get("year"))}
 
 
 async def _anime_lookup_core(session, p: dict, anilist_key: str, use_anilist: bool, minutes=None) -> dict:
