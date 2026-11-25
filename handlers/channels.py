@@ -40,7 +40,7 @@ from pyrogram.types import ChatPrivileges, InlineKeyboardButton, InlineKeyboardM
 from core.config import Config
 from core.database import db
 from plugins.controls import AUTOSORT_CATEGORIES, SESSION_STRING_SIZE, parse_buttons
-from plugins.classify import title_in_whitelist, classify, get_filename
+from plugins.identify import title_in_whitelist, classify, get_filename
 
 try:
     from pyromod.listen.listen import ListenerCanceled
@@ -296,7 +296,7 @@ def text_without_links(message):
 # the file (before the Movie / Series / Anime gates), so a real movie that a gate sent to Other is still captioned.
 # When no usable name can be found, nothing is rebuilt: the original caption (links removed) is used.
 #
-# Round 3 (Step 1 of the caption): when the classifier IDENTIFIED the file (info["ident"], plugins/classify.py), the caption
+# Round 3 (Step 1 of the caption): when the classifier IDENTIFIED the file (info["ident"], plugins/identify.py), the caption
 # is rebuilt from that record instead of from the raw release name - see ident_caption():
 #     movie   Title (Year)                      + quality tags
 #     series  Title (Year) S01E05 | S01 | S01-S03 + quality tags
@@ -595,7 +595,7 @@ def _ep_numbers(ep):
 
 def ident_caption(message, classified, ident):
     """Step 1 of the /autosort caption. -> (caption, facts), or (None, None) when nothing can be built (then the caller keeps the
-    file-name caption of autosort_caption()). `ident` is info["ident"] of plugins/classify.py: {kind, title, year, source, id
+    file-name caption of autosort_caption()). `ident` is info["ident"] of plugins/identify.py: {kind, title, year, source, id
     [, season]}. The title and year are the CANONICAL ones of the identified TMDB / AniList record; the quality tags (resolution,
     source, platform, codec, HDR, language, audio, subs) come from the name; the season / episode come from the file name first,
     then - for series and anime only, NEVER for a movie - from the caption lines. A year the record lacks is taken from the name.
@@ -707,7 +707,7 @@ def _media_unique_id(message):
     return None
 
 
-# The whitelists (see below) only ever apply to content classify.py has
+# The whitelists (see below) only ever apply to content identify.py has
 # actually identified as that kind of release - never to
 # education/pdf/image/audio/files/other. This matters for two reasons:
 #   1. It stops a lecture/course video from silently being blocked just
@@ -715,7 +715,7 @@ def _media_unique_id(message):
 #   2. It ALSO catches the reverse and more important case: education
 #      content that classify() mistakenly promotes to "series" (a lecture
 #      filename with a stray "S01E02"-looking number plus a quality tag
-#      can trip guessit's episode detection - see classify.py's
+#      can trip guessit's episode detection - see identify.py's
 #      _has_release_signal). Since that file is now *categorized* as
 #      "series", the series whitelist DOES apply to it, and it gets
 #      blocked unless its guessed title happens to equal a real
@@ -725,7 +725,7 @@ def _media_unique_id(message):
 # Movie and series are two INDEPENDENT lists (plugins/settings.py's
 # "Movie Whitelist" and "Series Whitelist" screens, each with their own
 # exact/loose mode) - a user can restrict one without touching the other.
-# Anime rides along with the movie list since classify.py doesn't split
+# Anime rides along with the movie list since identify.py doesn't split
 # anime out as its own /autosort category pairing the way series is.
 _MOVIE_WHITELIST_CATEGORIES = {"movie", "movie_files", "anime", "anime_files"}
 _SERIES_WHITELIST_CATEGORIES = {"series", "series_files"}
@@ -761,7 +761,7 @@ def check_filters(message, configs: dict, disabled_types, seen_file_ids=None):
         if keywords and not any(kw.lower() in filename.lower() for kw in keywords):
             return False, "filtered"
 
-        # Movie/anime and series name whitelists (see plugins/classify.py's
+        # Movie/anime and series name whitelists (see plugins/identify.py's
         # title_in_whitelist() and /settings -> Filters -> Movie/Series
         # Whitelist). Unlike "keywords" above (raw filename substring),
         # these compare against the guessit/anitopy-parsed title, so they

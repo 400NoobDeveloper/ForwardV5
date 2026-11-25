@@ -40,7 +40,7 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from core.database import db
 from core.config import temp
 from plugins.controls import Translation, CLIENT, start_clone_bot, _verify_openai_key
-from plugins.classify import _openai_chat, _OPENAI_BAD_KEYS, OPENAI_MIN_CONFIDENCE, get_filename
+from plugins.identify import _openai_chat, _OPENAI_BAD_KEYS, OPENAI_MIN_CONFIDENCE, get_filename
 from plugins.channels import check_filters, clean_caption
 
 try:

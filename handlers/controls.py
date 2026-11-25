@@ -362,10 +362,10 @@ CLIENT_HELPER = CLIENT()
 # it's message.video or message.document, its mime_type,
 # whether it has a thumbnail, size, filename, etc.
 #
-# This exists because classify.py's video-vs-document routing
+# This exists because identify.py's video-vs-document routing
 # depends on pyrogram's own message.video/message.document
 # split, which doesn't always match what a play-button preview
-# in the Telegram app visually suggests (see plugins/classify.py's
+# in the Telegram app visually suggests (see plugins/identify.py's
 # note above `is_files_variant = ...`). Rather than keep guessing
 # at heuristics, reply to a specific problem message with this
 # command and share the output - that's real ground truth instead
@@ -402,7 +402,7 @@ CANCEL_BTN = InlineKeyboardMarkup([[InlineKeyboardButton('• ᴄᴀɴᴄᴇʟ',
 # /settings controls: key checks, AniList test, button builders, constants
 # ======================================================================
 
-# categories from plugins/classify.py that /autosort can route to a channel
+# categories from plugins/identify.py that /autosort can route to a channel
 AUTOSORT_CATEGORIES = [
     ("movie", "Movies (Video)"),
     ("movie_files", "Movies (Files)"),
@@ -421,8 +421,8 @@ AUTOSORT_CATEGORIES = [
 ]
 
 # Two independent name-whitelists (see plugins/channels.py's check_filters()
-# and plugins/classify.py's title_in_whitelist()) - "movie" also covers
-# anime (both use classify.py's movie-ish categories), "series" is fully
+# and plugins/identify.py's title_in_whitelist()) - "movie" also covers
+# anime (both use identify.py's movie-ish categories), "series" is fully
 # separate so a user can restrict series without touching movies or
 # vice versa. Keyed by the callback-data/kind name used throughout the
 # settings handlers below.
@@ -470,7 +470,7 @@ async def _verify_openai_key(key: str):
     if not key:
         return False, "No key given."
     try:
-        from plugins.classify import OPENAI_MODEL, OPENAI_URL
+        from plugins.identify import OPENAI_MODEL, OPENAI_URL
     except Exception:
         OPENAI_MODEL, OPENAI_URL = "gpt-4o-mini", "https://api.openai.com/v1/chat/completions"
     body = {
@@ -501,13 +501,13 @@ async def _verify_openai_key(key: str):
         return False, f"Could not reach OpenAI: {e}"
 
 async def _verify_tpdb_key(key: str):
-    """One real ThePornDB request - the same /scenes lookup plugins/classify.py
+    """One real ThePornDB request - the same /scenes lookup plugins/identify.py
     makes - so the result covers the token and the API being reachable.
     200 = token accepted; 401/403 = rejected."""
     if not key:
         return False, "No key given."
     try:
-        from plugins.classify import TPDB_URL, TPDB_TIMEOUT_SECONDS
+        from plugins.identify import TPDB_URL, TPDB_TIMEOUT_SECONDS
     except Exception:
         TPDB_URL, TPDB_TIMEOUT_SECONDS = "https://api.theporndb.net", 15
     try:
@@ -559,7 +559,7 @@ async def _test_anilist(key: str = ""):
     """Live check of AniList's GraphQL API: one real lookup, so the user sees
     both that the API is reachable and what a match looks like. Uses the
     user's token too, if one is set."""
-    from plugins.classify import anilist_lookup
+    from plugins.identify import anilist_lookup
     try:
         status, media = await anilist_lookup("Naruto", anilist_key=key)
     except Exception as e:
