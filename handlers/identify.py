@@ -300,6 +300,12 @@ EDU_PRECHECK = _env_on("EDU_PRECHECK")                         # 15e  strong cou
 IDENT_RECORD = _env_on("IDENT_RECORD")                         # 15f  info["ident"]: canonical title / year of the identified record
 FINAL_PASS = _env_on("FINAL_PASS")                             # 15g  one full re-check before a file stays in Other
 
+# ---- round 4 (/autosort only, deep mode). Same convention: default on, 0 / false / no / off = the OLD behaviour; every helper is
+# wrapped with _new_rule (an exception = ONE WARNING + the old behaviour for that file).
+AUTOSORT_VIDEO_FIRST = _env_on("AUTOSORT_VIDEO_FIRST")         # 4a  a video / release name ending in ".AAC" / ".DTS" is a VIDEO, not audio
+AUTOSORT_ALL_CAPTION_LINES = _env_on("AUTOSORT_ALL_CAPTION_LINES")   # 4b  every usable caption line is a candidate (promo lines out)
+AUTOSORT_CAPTION_PRIMARY = _env_on("AUTOSORT_CAPTION_PRIMARY") # 4c  a useless / generic file name goes AFTER the caption lines
+
 CATEGORIES = (
     "anime", "anime_files",
     "series", "series_files",
@@ -744,7 +750,11 @@ def _candidate_names(message, max_lines: int = 2, signal: bool = False) -> list:
     signal are appended (see _signal_lines()); everything else is unchanged."""
     names = []
     fn = get_filename(message)
-    if fn:
+    deep_all = bool(signal and AUTOSORT_ALL_CAPTION_LINES)
+    if deep_all:
+        max_lines = max(max_lines, CAPTION_LINES_WHEN_NAME_USELESS)     # 4b: every usable caption line, not only two
+    name_last = bool(fn and signal and _caption_primary(fn))              # 4c: a useless name ("v .mp4") goes last
+    if fn and not name_last:
         names.append(fn)
     caption = getattr(message, "caption", None) or ""
     added = 0
@@ -755,13 +765,77 @@ def _candidate_names(message, max_lines: int = 2, signal: bool = False) -> list:
         cleaned = _clean_name(line)
         if len(re.findall(r"\w", cleaned)) < 2:
             continue
+        if deep_all and (_promo_line(line) or line in names):
+            continue
         names.append(line)
         added += 1
         if added >= max_lines:
             break
     if signal and CAPTION_SIGNAL_LINES:
         names += _signal_lines(caption, names)
+    if name_last:
+        names.append(fn)
     return names
+
+
+# Caption lines that are only channel promotion ("Join @MoviesHub for more", "Share & Support Us", "Uploaded By ...").
+_PROMO_WORDS = {
+    "join", "joined", "subscribe", "follow", "share", "support", "us", "our", "for", "more", "movies", "movie", "series", "new",
+    "latest", "updates", "update", "channel", "channels", "group", "telegram", "tg", "click", "here", "link", "links", "download",
+    "watch", "online", "free", "request", "requests", "uploaded", "upload", "by", "powered", "backup", "main", "official",
+    "and", "the", "to", "now", "daily", "all", "hd", "best", "your", "please", "via", "from", "on", "at", "of", "in",
+}
+_PROMO_START_RE = re.compile(r"^\W*(?:join|subscribe|follow|share|support|click|uploaded|upload(?:ed)?\s+by|powered\s+by|"
+                             r"request|backup|main\s+channel)\b", re.IGNORECASE)
+
+
+@_new_rule(lambda *a, **k: False)
+def _promo_line(line: str) -> bool:
+    """AUTOSORT_ALL_CAPTION_LINES: True for a caption line that is only channel promotion. A line with a year or an episode marker
+    is never promotion (it may be the title line)."""
+    cleaned = _clean_name(line or "")
+    if re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)", cleaned) or _EP_MARKER_RE.search(cleaned):
+        return False
+    words = re.findall(r"[^\W\d_]+", cleaned.lower())
+    if not words:
+        return False
+    return bool(_PROMO_START_RE.match(cleaned)) or all(w in _PROMO_WORDS for w in words)
+
+
+@_new_rule(lambda *a, **k: False)
+def _caption_primary(filename) -> bool:
+    """AUTOSORT_CAPTION_PRIMARY: the file name is missing, truncated or generic ("video_123.mp4", "v .mp4", "IMG_2023"), so the
+    caption is the primary source - its lines are tried first, the name last."""
+    if not AUTOSORT_CAPTION_PRIMARY or not filename:
+        return False
+    return bool(_name_is_useless(filename) or _name_is_generic(filename))
+
+
+@_new_rule(lambda *a, **k: False)
+def _video_first(message, filename: str, ext: str) -> bool:
+    """AUTOSORT_VIDEO_FIRST: a file whose "extension" is an audio tag is a VIDEO when
+      * it is a native Telegram video, or its MIME type is video/*, or
+      * it is not sent as Telegram audio / voice, its MIME type is not audio/*, and the name is a release name
+        (year / SxxExx + quality / codec tags): "Movie.2019.720p.WEB-DL.DDP5.1.AAC", "Show.S01E02.1080p.x264.DTS".
+    Real music (".mp3" / ".flac" / ".m4a" ... sent as audio, or a document with an audio/* MIME type) stays audio."""
+    if not AUTOSORT_VIDEO_FIRST or ext not in DEEP_AUDIO_EXTENSIONS:
+        return False
+    if getattr(message, "video", None) is not None or _doc_video_mime(message):
+        return True
+    if getattr(message, "voice", None) is not None:
+        return False
+    # Telegram guesses the MIME type from the fake extension (".AAC" -> audio/aac), so the MIME type alone proves nothing here:
+    # a VIDEO quality / source / codec tag together with a year or an episode marker does. Music never carries "720p WEB-DL".
+    stem = (filename or "")[: -len(ext)] if ext and (filename or "").lower().endswith(ext) else (filename or "")
+    if not _VIDEO_TAG_RE.search(stem):
+        return False
+    return bool(re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)", stem) or _EP_MARKER_RE.search(stem) or _SEASON_RE.search(stem))
+
+
+_VIDEO_TAG_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:\d{3,4}[pi]|4k|uhd|web[ ._-]?dl|web[ ._-]?rip|webrip|blu[ ._-]?ray|bdrip|brrip|hdrip|dvdrip|dvdscr|"
+    r"hdtv|hdcam|camrip|pre[ ._-]?dvd|x26[45]|h[ ._]?26[45]|hevc|avc|xvid|divx|10[ ._-]?bit|hdr10?|dovi|remux|amzn|nf|dsnp|"
+    r"hmax|zee5|jiohs|sonyliv)(?![A-Za-z0-9])", re.IGNORECASE)
 
 
 @_new_rule(lambda *a, **k: [])
@@ -2318,6 +2392,9 @@ def _early_category(message, archives_as_files: bool = False):
     if archives_as_files and _deep_is_video(message, filename, ext):
         # deep: a video by MIME type / container / release name (see _deep_is_video); the "_files" variant is a document
         return None, _candidate_names(message, wide, True), getattr(message, "document", None) is not None
+    if archives_as_files and _video_first(message, filename, ext):
+        # 4a: "Movie.2019.720p.WEB-DL.DDP5.1.AAC" (no real extension) / a native video named "... .DTS": a video, not audio
+        return None, _candidate_names(message, wide, True), getattr(message, "document", None) is not None
     if ext in (DEEP_AUDIO_EXTENSIONS if archives_as_files else AUDIO_EXTENSIONS):
         return "audio", [], False
 
@@ -3531,6 +3608,8 @@ def _signal_recheck(message):
         return "pdf"
     if ext in IMAGE_EXTENSIONS or mime.startswith("image/"):
         return "image"
+    if _video_first(message, name, ext):
+        return "video"                                # 4a: video first - an ".AAC" / ".DTS" release tag is not an audio file
     if ext in DEEP_AUDIO_EXTENSIONS or mime.startswith("audio/"):
         return "audio"
     if ext in ARCHIVE_EXTENSIONS or mime in _ARCHIVE_MIMES or (name and _is_split_part(name)):
@@ -3553,7 +3632,8 @@ def _widen_names(message, names0: list) -> list:
     caption lines with a clear release signal, the file name first. The split-part suffix is removed by the parser itself."""
     out = []
     fn = get_filename(message)
-    for n in ([fn] if fn else []) + list(names0) + _candidate_names(message, 12, True):
+    first = [fn] if fn and not _caption_primary(fn) else []
+    for n in first + list(names0) + _candidate_names(message, 12, True):
         if n and n not in out:
             out.append(n)
     return out[:16]
@@ -3631,7 +3711,7 @@ async def _final_check(message, category, session, tmdb_key, use_anilist, anilis
     for i, raw in enumerate(names2):
         p = _parse_name_safe(raw, check_extra=(i == 0), deep=True, anime=anime_mode)
         if p:
-            p["from_name"] = bool(i == 0 and has_fn)
+            p["from_name"] = bool(has_fn and raw == get_filename(message))
             _widen_parse(raw, p)
             parsed2.append(p)
     fp["names"] = len(names2)
@@ -3847,7 +3927,7 @@ async def _classify_async_main(message, session=None, tmdb_key: str = "", use_an
         # "Movie (2025) Official Trailer" was matched to the movie on TMDB.
         p = _parse_name_safe(raw, check_extra=(i == 0), deep=deep_series, anime=anime_mode)
         if p:
-            p["from_name"] = bool(i == 0 and has_fn)          # this parse is the FILE NAME's (not a caption line's)
+            p["from_name"] = bool(has_fn and raw == get_filename(message))   # this parse is the FILE NAME's (not a caption line's)
             parsed.append(p)
     if not parsed:
         _other_note(info, "unidentified", "no usable title in the name")
