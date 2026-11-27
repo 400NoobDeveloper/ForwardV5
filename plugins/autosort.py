@@ -144,6 +144,27 @@ AUTOSORT_FILES_FALLBACK = os.environ.get("AUTOSORT_FILES_FALLBACK", "1").strip()
 # per-message error isolation and the reconciliation line of the completed message. 0 = old behaviour.
 AUTOSORT_MSG_LOG = os.environ.get("AUTOSORT_MSG_LOG", "1").strip().lower() not in ("0", "false", "no", "off")
 
+# AUTOSORT_COPY_RESCUE=1 (default): when copy_message fails, the file is retried in ITS channel (trimmed caption, original
+# caption, plain forward) before it falls back to Other. 0 = old behaviour (straight to Other).
+AUTOSORT_COPY_RESCUE = os.environ.get("AUTOSORT_COPY_RESCUE", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _short_caption(caption):
+    """Plain text, at most 1024 characters (Telegram's caption limit), cut on a line / word boundary. None stays None."""
+    if caption is None:
+        return None
+    try:
+        import html as _h
+        text = _h.unescape(re.sub(r"<[^>]+>", "", str(caption)))
+        if len(text) <= 1024:
+            return _h.escape(text, quote=False)
+        cut = text[:1020]
+        cut = cut[: max(cut.rfind("\n"), cut.rfind(" "), 900)]
+        return _h.escape(cut.rstrip() + " …", quote=False)
+    except Exception:
+        return None
+
+
 _TWIN_BASES = ("movie", "series", "anime", "education", "nsfw")
 
 
@@ -1445,6 +1466,25 @@ async def _run(client, user_id, m, cfg):
                     client, dest, from_chat, message.id, m, stats, mapping, pacing, total_files,
                     caption=caption, text=new_text,
                 )
+                if not ok and new_text is None and AUTOSORT_COPY_RESCUE and dest != other_dest:
+                    # 6g: the copy failed (caption > 1024, bad HTML entity, protected media ...): the RIGHT channel first -
+                    # a trimmed plain caption, then the original caption, then a plain forward - before Other.
+                    try:
+                        short = _short_caption(caption)
+                        if short is not None and short != caption:
+                            ok = await _copy_with_retry(client, dest, from_chat, message.id, m, stats, mapping, pacing,
+                                                        total_files, caption=short)
+                        if not ok:
+                            ok = await _copy_with_retry(client, dest, from_chat, message.id, m, stats, mapping, pacing,
+                                                        total_files)
+                        if not ok:
+                            ok = await _copy_with_retry(client, dest, from_chat, message.id, m, stats, mapping, pacing,
+                                                        total_files, forward=True)
+                        if ok:
+                            logger.info("autosort copy-rescue: msg=%s name=%r delivered to %s after the first copy failed",
+                                        message.id, _movie_label(message), category)
+                    except Exception as e:
+                        logger.warning("autosort: copy rescue failed for msg %s (%s) - old behaviour", message.id, e)
                 if not ok and new_text is None:
                     # Unsupported by copy_message -> plain-forward it to Other.
                     ok = await _copy_with_retry(
