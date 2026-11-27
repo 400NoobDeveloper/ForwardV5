@@ -1260,6 +1260,22 @@ async def _run(client, user_id, m, cfg):
     remove_links = AUTOSORT_REMOVE_LINKS or bool(configs.get("remove_caption_link"))
     dest_chats = list(set(mapping.values()))
     live = _LIVE[user_id] = {"stats": stats, "mapping": mapping, "pacing": pacing, "total": total_files, "paused": False}
+    if AUTOSORT_MSG_LOG:
+        # P5 evidence: the category -> channel mapping of THIS run (a wrong mapping looks exactly like a wrong classification)
+        try:
+            for cat in CATEGORIES:
+                twin = _files_fallback(cat, mapping)
+                logger.info("autosort mapping: %s -> %s", cat,
+                            mapping.get(cat) if mapping.get(cat) is not None
+                            else (f"{mapping[twin]} (fallback {twin})" if twin else f"{other_dest} (other, unmapped)"))
+            dupes = {}
+            for cat, chat in mapping.items():
+                dupes.setdefault(chat, []).append(cat)
+            for chat, cats in dupes.items():
+                if len(cats) > 1 and not set(cats) <= {"other", "duplicate"} | {c for c in cats if _twin_category(c) in cats}:
+                    logger.warning("autosort mapping: channel %s is mapped to several categories: %s", chat, ", ".join(cats))
+        except Exception as e:
+            logger.warning("autosort: could not log the mapping (%s)", e)
     await _notify(client, user_id, "Forwarding Started", mapping)
 
     try:
