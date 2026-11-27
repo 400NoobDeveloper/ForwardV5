@@ -306,6 +306,16 @@ AUTOSORT_VIDEO_FIRST = _env_on("AUTOSORT_VIDEO_FIRST")         # 4a  a video / r
 AUTOSORT_ALL_CAPTION_LINES = _env_on("AUTOSORT_ALL_CAPTION_LINES")   # 4b  every usable caption line is a candidate (promo lines out)
 AUTOSORT_CAPTION_PRIMARY = _env_on("AUTOSORT_CAPTION_PRIMARY") # 4c  a useless / generic file name goes AFTER the caption lines
 
+# ---- round 5 (/autosort only, deep mode). Default on, 0 / false / no / off = the OLD behaviour; helpers wrapped with _new_rule.
+EDU_RELEASE_GUARD = _env_on("EDU_RELEASE_GUARD")               # 5a  a release name (WEB-DL / x264 / DDP / SLIV / S01+720p ...) is never education
+EDU_EXAM_PRECHECK = _env_on("EDU_EXAM_PRECHECK")               # 5b  two exam-prep signals (+ no release tag) = education before any API call
+SUBTITLE_EXT_FIRST = _env_on("SUBTITLE_EXT_FIRST")             # 5c  .srt .ass .ssa .vtt .sub .txt .nfo: the extension decides, never the MIME type
+SPLIT_STRICT = _env_on("SPLIT_STRICT")                         # 5d  ".001" is a split part only after a container / archive extension
+ANILIST_PREFIX_MATCH = _env_on("ANILIST_PREFIX_MATCH")         # 5e  "Kekkon Yubiwa" matches "Kekkon Yubiwa Monogatari" (fansub-tagged names)
+FANSUB_IS_ANIME = _env_on("FANSUB_IS_ANIME")                   # 5f  "[Judas] Title - S01E07" a TMDB show matched -> anime, not series
+DEEP_PROMO_CLEAN = _env_on("DEEP_PROMO_CLEAN")                 # 5g  "New Released Full ... Dubbed Movie", "720p24.0fps 2689", Arabic "الحلقة N"
+EPISODE_NEVER_MOVIE = _env_on("EPISODE_NEVER_MOVIE")           # 5h  a file name with an episode / season-pack marker is never "movie"
+
 CATEGORIES = (
     "anime", "anime_files",
     "series", "series_files",
@@ -356,7 +366,27 @@ def _is_split_part(filename: str) -> bool:
     return any(p.search(filename) for p in _SPLIT_PART_PATTERNS)
 
 
+_SPLIT_STRICT_RE = re.compile(
+    r"\.(?:mkv|mp4|avi|webm|mov|wmv|ts|m4v|flv|mpg|mpeg|m2ts|vob|zip|rar|7z|tar|gz|bz2|xz|iso)\.\d{3}$", re.IGNORECASE)
+
+
+def _split_deep(filename: str) -> bool:
+    """SPLIT_STRICT (/autosort only): a real split part - ".part1.rar" / ".part004.mkv", ".r00", or ".001" right AFTER a container
+    / archive extension ("name.mkv.001", "x.7z.002"). A name that merely ends in three digits ("...WEB-DL.H.264", "x.265", ".720")
+    is not one. Off: the old _is_split_part()."""
+    if not SPLIT_STRICT:
+        return _is_split_part(filename)
+    try:
+        f = filename or ""
+        return bool(_SPLIT_PART_PATTERNS[0].search(f) or _SPLIT_PART_PATTERNS[2].search(f) or _SPLIT_STRICT_RE.search(f))
+    except Exception as e:
+        _rule_warn("_split_deep", e)
+        return _is_split_part(filename)
+
+
 def _strip_split_suffix(filename: str) -> str:
+    if SPLIT_STRICT and not _is_split_part(filename):
+        return filename
     filename = re.sub(r"\.part\d+(?=\.)", "", filename, flags=re.IGNORECASE)
     filename = re.sub(r"\.\d{3}$", "", filename)
     filename = re.sub(r"\.r\d{2}$", "", filename)
@@ -811,6 +841,18 @@ def _caption_primary(filename) -> bool:
     return bool(_name_is_useless(filename) or _name_is_generic(filename))
 
 
+_TEXT_SUB_EXTS = {".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup", ".txt", ".nfo"}
+
+
+@_new_rule(lambda *a, **k: False)
+def _ext_not_audio(ext: str) -> bool:
+    """SUBTITLE_EXT_FIRST: a KNOWN non-audio extension (subtitle / text / office / archive / video / pdf / image ...) is never
+    rescued into Audio by its MIME type (Python's mimetypes guesses ".ass" as audio/aac)."""
+    if not SUBTITLE_EXT_FIRST or not ext:
+        return False
+    return ext in _TEXT_SUB_EXTS or (ext in _KNOWN_EXTS and ext not in DEEP_AUDIO_EXTENSIONS)
+
+
 @_new_rule(lambda *a, **k: False)
 def _video_first(message, filename: str, ext: str) -> bool:
     """AUTOSORT_VIDEO_FIRST: a file whose "extension" is an audio tag is a VIDEO when
@@ -935,7 +977,7 @@ def _deep_is_video(message, filename: str, ext: str) -> bool:
     Normal video extensions and split archive names (".mkv.001", ".r00") keep their old routing (False here)."""
     if not DEEP_VIDEO_BY_MIME or ext in VIDEO_EXTENSIONS or ext in PDF_EXTENSIONS or ext in IMAGE_EXTENSIONS:
         return False
-    if _is_split_part(filename):
+    if _split_deep(filename):
         return False
     if ext in _DEEP_EXTRA_VIDEO_EXTENSIONS:
         return True
@@ -1288,12 +1330,71 @@ _SITE_TAIL_RE = re.compile(
 _DUP_YEAR_RE = re.compile(r"([\(\[]\s*(?:19|20)\d{2}\s*[\)\]])(?:[\s._-]*\1)+")
 
 
+_YT_TAIL_RE = re.compile(r"(?<![A-Za-z0-9])(\d{1,4})p\s*\d{2,3}(?:\.\d+)?\s*fps(?:\s+\d{2,6})?(?![A-Za-z0-9])", re.IGNORECASE)
+_PROMO_SEG_WORDS = {
+    "new", "newly", "released", "release", "latest", "full", "hd", "movie", "movies", "film", "films", "dubbed", "dub", "south",
+    "indian", "hollywood", "bollywood", "tollywood", "kollywood", "sandalwood", "mollywood", "action", "thriller", "romantic",
+    "romance", "comedy", "horror", "crime", "drama", "love", "family", "revenge", "suspense", "mystery", "superhit", "super",
+    "hit", "blockbuster", "best", "official", "version", "in", "the", "a", "with", "and", "&", "+", "new2", "2k", "4k",
+    "exclusive", "premiere", "world", "tv", "television",
+}
+_PROMO_LANGS = {"hindi", "tamil", "telugu", "kannada", "malayalam", "bengali", "bangla", "marathi", "punjabi", "english",
+                "urdu", "gujarati", "odia", "bhojpuri"}
+_PROMO_IN_TITLE_RE = re.compile(
+    r"(?<![A-Za-z])(?:new(?:ly)?\s+released?|full\s+(?:hd\s+)?(?:movie|film)|(?:%s)\s+dubbed(?:\s+(?:full\s+)?(?:movie|film))?)"
+    r"(?![A-Za-z])" % "|".join(sorted(_PROMO_LANGS)), re.IGNORECASE)
+_AR_EPISODE_WORD = "\u0627\u0644\u062d\u0644\u0642\u0629"            # "الحلقة" = "the episode"
+_AR_EP_RE = re.compile(r"(?:(\d{1,4})\s*%s|%s\s*(\d{1,4}))" % (_AR_EPISODE_WORD, _AR_EPISODE_WORD))
+_ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
+
+
+@_new_rule(lambda name: name)
+def _promo_clean(name: str) -> str:
+    """DEEP_PROMO_CLEAN (/autosort deep mode): remove promotion noise from a video name, keep the language as a hint.
+      * the YouTube-rip tail "<height>p<fps>fps <number>" ("720p24.0fps 2689" -> "720p", "2p25fps 4335" -> "")
+      * " - New Released Full Kannada Dubbed Movie | South Action Thriller Movie" -> " Kannada"
+      * Arabic "<title> 8 الحلقة" / "الحلقة 8" -> "<title> Episode 8" (the number next to the word, either side; other stray
+        numbers between the title and the word are dropped)."""
+    if not DEEP_PROMO_CLEAN or not name:
+        return name
+    m = _VIDEO_EXT_END_RE.search(name)
+    stem, ext = (name[:m.start()], m.group(0)) if m else (name, "")
+    stem = _YT_TAIL_RE.sub(lambda mm: (f" {mm.group(1)}p " if len(mm.group(1)) >= 3 else " "), stem)
+    if _ARABIC_RE.search(stem) and _AR_EPISODE_WORD in stem:
+        clean = _HANDLE_RE.sub(" ", stem)
+        em = _AR_EP_RE.search(clean)
+        if em:
+            ep = int(em.group(1) or em.group(2))
+            head = clean[:em.start()]
+            title = re.sub(r"[\s\d._\-–—|]+$", "", re.split(r"(?<=[\u0600-\u06FF])\s+\d", head, maxsplit=1)[0])
+            title = re.sub(r"\s{2,}", " ", title).strip()
+            tail = clean[em.end():]
+            if len(_ARABIC_RE.findall(title)) >= 2:
+                stem = f"{title} Episode {ep} {tail}"
+    segs = re.split(r"\s+[-–—]\s+|\s*[|｜]\s*", stem)
+    if len(segs) > 1:
+        keep, extra = [segs[0]], []
+        for seg in segs[1:]:
+            toks = [t for t in re.split(r"[\s._]+", seg) if t]
+            low = [re.sub(r"[^a-z0-9&+]", "", t.lower()) for t in toks]
+            if toks and all(w in _PROMO_SEG_WORDS or w in _PROMO_LANGS or _TECH_TOKEN_RE.match(t) or not w
+                            for t, w in zip(toks, low)):
+                extra += [t for t, w in zip(toks, low) if w in _PROMO_LANGS or _TECH_TOKEN_RE.match(t)]
+            else:
+                keep.append(seg)
+        stem = " - ".join(keep) + (" " + " ".join(dict.fromkeys(extra)) if extra else "")
+    stem = _PROMO_IN_TITLE_RE.sub(lambda mm: " " + next((w for w in mm.group(0).split() if w.lower() in _PROMO_LANGS), "") + " ",
+                                  stem)
+    stem = re.sub(r"\s{2,}", " ", stem).strip(" -–—|")
+    return (stem + ext) if len(re.findall(r"[^\W\d_]", stem)) >= 2 else name
+
+
 def _deep_pre(name: str):
     """-> (name, flags): the deep clean-up above. flags = {"broadcaster", "tv_source", "ep_of", "pack", "serial"}.
     Runs BEFORE the movie / series name machinery sees the name. Pure string work; never raises."""
     flags = {"broadcaster": None, "tv_source": False, "ep_of": None, "pack": False, "serial": False}
     try:
-        stem = _clean_name(_strip_release_noise(name))
+        stem = _clean_name(_strip_release_noise(_promo_clean(name)))
         m = _VIDEO_EXT_END_RE.search(stem)
         stem, ext = (stem[:m.start()], m.group(0)) if m else (stem, "")
         bm = _BCAST_RE.match(stem)
@@ -2124,7 +2225,7 @@ def _parse_name(raw: str, check_extra: bool = False, deep: bool = False, anime: 
     if deep:
         raw = _url_decode(raw)
     anime = bool(anime and deep)
-    name = _strip_split_suffix(raw) if _is_split_part(raw) else raw
+    name = _strip_split_suffix(raw) if (_split_deep(raw) if deep else _is_split_part(raw)) else raw
     pre = {}
     if deep:
         name, pre = _deep_pre(name)               # counted episodes, season packs, TV-source tags, broadcaster / site tags
@@ -2398,7 +2499,7 @@ def _early_category(message, archives_as_files: bool = False):
     if ext in (DEEP_AUDIO_EXTENSIONS if archives_as_files else AUDIO_EXTENSIONS):
         return "audio", [], False
 
-    is_split = _is_split_part(filename)
+    is_split = _split_deep(filename) if archives_as_files else _is_split_part(filename)
     is_video_ext = ext in VIDEO_EXTENSIONS
     if not is_video_ext and not is_split:
         if archives_as_files and ext in ARCHIVE_EXTENSIONS:
@@ -3568,12 +3669,30 @@ def _propagate_series_like(parsed: list, deep: bool = False) -> None:
 
 
 @_new_rule(lambda *a, **k: False)
+def _edu_exam_first(message, names, parsed) -> bool:
+    """EDU_EXAM_PRECHECK: two independent exam-prep signals (exam word + subject / teacher / hashtag list ...) and NO release
+    tag in any name = education, decided before TMDB / AniList. A year ("Haryana CET Mains 2025") and a YouTube resolution
+    ("480p30.0fps 672") do not stop it; an episode marker, a release tag, adult words or a sample / trailer do."""
+    if not EDU_EXAM_PRECHECK or not EDU_EXAM_RULES:
+        return False
+    if any(pp.get("strong_episode") or pp.get("extra") for pp in parsed):
+        return False
+    if any(_edu_is_release(n) or _EDU_RELEASE_GUARD_RE.search(n or "") for n in names):
+        return False
+    if is_nsfw(message) or _extra_hit(parsed, names):
+        return False
+    return len(_edu_signals(names)) >= 2
+
+
+@_new_rule(lambda *a, **k: False)
 def _edu_precheck(message, names, parsed) -> bool:
     """EDU_PRECHECK: STRONG course naming (numbered lecture "5.1.3 Intro", "Lecture 5", "class 12 chapter 3", a course platform)
     in a name with no year, no release tag and no episode marker is education - no source can confirm such a name anyway, so
     nothing is sent to TMDB / AniList. Soft course words, release names and episodes are NOT decided here."""
     if not EDU_PRECHECK or not parsed:
         return False
+    if _edu_exam_first(message, names, parsed):
+        return True
     if any(pp.get("has_movie_signal") or pp.get("strong_episode") or pp.get("year") or pp.get("extra") for pp in parsed):
         return False
     if is_nsfw(message) or _extra_hit(parsed, names):
@@ -3610,9 +3729,11 @@ def _signal_recheck(message):
         return "image"
     if _video_first(message, name, ext):
         return "video"                                # 4a: video first - an ".AAC" / ".DTS" release tag is not an audio file
+    if _ext_not_audio(ext):
+        return None                                   # 5c: ".ass" / ".srt" ...: the extension decides (audio/aac is a mimetypes guess)
     if ext in DEEP_AUDIO_EXTENSIONS or mime.startswith("audio/"):
         return "audio"
-    if ext in ARCHIVE_EXTENSIONS or mime in _ARCHIVE_MIMES or (name and _is_split_part(name)):
+    if ext in ARCHIVE_EXTENSIONS or mime in _ARCHIVE_MIMES or (name and _split_deep(name)):
         return "files"
     if ext in VIDEO_EXTENSIONS or ext in _DEEP_EXTRA_VIDEO_EXTENSIONS:
         return "video"
@@ -4143,7 +4264,7 @@ def is_split_video_part(message) -> bool:
     name = ""
     try:
         name = get_filename(message) or ""
-        return (_is_split_part(name)
+        return (_split_deep(name)
                 and os.path.splitext(_strip_split_suffix(name))[1].lower() in VIDEO_EXTENSIONS)
     except Exception:
         return False
@@ -5781,12 +5902,15 @@ def _edu_signals(names, show_names=()) -> set:
     if not EDU_EXAM_RULES:
         return found
     try:
-        shows = [_norm_cmp(s) for s in show_names if s and s.strip()]
+        norm = _edu_norm if EDU_RELEASE_GUARD else _norm_cmp
+        shows = [norm(s) for s in show_names if s and s.strip()]
         for raw in names:
             text = raw or ""
             if _MOVIE_BRACKET_YEAR_RE.search(text) or _EDU_RELEASE_GUARD_RE.search(text) or _DEEP_EP_RE.search(text):
                 continue
-            rest = _norm_cmp(re.sub(r"[._]", " ", _VIDEO_EXT_TAIL_RE.sub("", text)))
+            if EDU_RELEASE_GUARD and _edu_is_release(text):
+                continue
+            rest = norm(re.sub(r"[._]", " ", _VIDEO_EXT_TAIL_RE.sub("", text)))
             for s in shows:
                 if s:
                     rest = rest.replace(s, " ")
@@ -5806,6 +5930,32 @@ def _edu_signals(names, show_names=()) -> set:
     return found
 
 
+_EDU_RELEASE_EXTRA_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:atmos|truehd|dts(?:[\s._-]?hd)?|e?ac3|ddp|amzn|nf|dsnp|hmax|sliv|zee5|jiohs|jhs|hs|mx|aha|sunnxt|"
+    r"hotstar|netflix|remux|hdr10?|dovi|webdl|hdtv)(?![A-Za-z0-9])", re.IGNORECASE)
+_EDU_PACK_RE = re.compile(r"(?<![A-Za-z0-9])(?:combined|complete|batch)(?![A-Za-z0-9])", re.IGNORECASE)
+_EDU_QUALITY_RE = re.compile(r"(?<![A-Za-z0-9])(?:\d{3,4}p|4k|uhd)(?![A-Za-z])", re.IGNORECASE)
+
+
+@_new_rule(lambda *a, **k: False)
+def _edu_is_release(text: str) -> bool:
+    """EDU_RELEASE_GUARD: the name is a RELEASE, never a course - a release tag (WEB-DL, BluRay, HDRip, x264 / H.264 / HEVC,
+    DD / DDP5.1, Atmos, AMZN NF SLIV ZEE5 JIOHS ...), or SxxExx / Season / COMBINED / Complete together with a quality tag.
+    A YouTube class rip ("480p30.0fps 672") has a resolution but none of these, so it stays a course candidate."""
+    if not EDU_RELEASE_GUARD or not text:
+        return False
+    t = text.replace("_", " ")
+    if _EDU_RELEASE_GUARD_RE.search(t) or _EDU_RELEASE_EXTRA_RE.search(re.sub(r"[._]", " ", t)):
+        return True
+    marker = _DEEP_EP_RE.search(t) or _SEASON_RE.search(t) or _EDU_PACK_RE.search(t)
+    return bool(marker and _EDU_QUALITY_RE.search(t))
+
+
+def _edu_norm(text: str) -> str:
+    """_norm_cmp() with apostrophes dropped first, so "Aren't" = "Arent" = "Aren t" when show-title words are removed."""
+    return _norm_cmp(re.sub(r"['’`´]", "", text or ""))
+
+
 def _edu_level(names, show_names=()) -> int:
     """0 = no course naming, 1 = SOFT (only generic words: "Lessons", "Classroom", "Chapter" - or two independent
     exam-prep signals, see _edu_signals()), 2 = STRONG (a numbered lecture "5.1.3 Intro to Python", a course / lecture /
@@ -5813,7 +5963,9 @@ def _edu_level(names, show_names=()) -> int:
     Words that belong to the matched SHOW's own title ("Some Lessons Aren't Taught In Classrooms") never count; the
     comparison ignores case, accents and punctuation. A year in brackets - "(2025)" - marks a release name, not a
     course, so it switches every word signal off (a numbered lecture name stays strong)."""
-    shows = [_norm_cmp(s) for s in show_names if s and s.strip()]
+    guard = EDU_RELEASE_GUARD
+    norm = _edu_norm if guard else _norm_cmp
+    shows = [norm(s) for s in show_names if s and s.strip()]
     level = 0
     for i, raw in enumerate(names):
         text = raw or ""
@@ -5821,7 +5973,9 @@ def _edu_level(names, show_names=()) -> int:
             return 2
         if _MOVIE_BRACKET_YEAR_RE.search(text):
             continue
-        rest = _norm_cmp(text.replace(".", " ").replace("_", " "))
+        if guard and _edu_is_release(text):
+            continue                                          # 5a: a release name never counts as course naming
+        rest = norm(text.replace(".", " ").replace("_", " "))
         for s in shows:
             if s:
                 rest = rest.replace(s, " ")
@@ -5972,6 +6126,30 @@ def _score_series(p: dict, tmdb=None, tvmaze=None, openai: bool = False, exact: 
     return True, score, sig, "ok"
 
 
+@_new_rule(lambda *a, **k: False)
+def _fansub_anime(parsed) -> bool:
+    """FANSUB_IS_ANIME: a name that starts with a KNOWN anime-only fansub group and carries an episode ("[Judas] Kekkon Yubiwa -
+    S01E07v2", "[SubsPlease] Title - 07")."""
+    if not FANSUB_IS_ANIME:
+        return False
+    for pp in parsed or []:
+        ap = pp.get("anime") or {}
+        if ap.get("fansub") and ap.get("known_group") and (ap.get("has_episode") or pp.get("strong_episode")):
+            return True
+    return False
+
+
+@_new_rule(lambda *a, **k: False)
+def _episode_marked(p: dict) -> bool:
+    """EPISODE_NEVER_MOVIE: this parsed name carries an episode / season-pack marker (SxxExx, "- 07", Episode N, Season N,
+    COMBINED / Complete / Batch), so it is a series or an anime, never a movie."""
+    if not EPISODE_NEVER_MOVIE or not p:
+        return False
+    ap = p.get("anime") or {}
+    return bool(p.get("strong_episode") or p.get("is_episode") or p.get("series_like") or p.get("season_pack")
+                or ap.get("has_episode") or (p.get("pre") or {}).get("pack"))
+
+
 def _series_other_reason(p: dict, reason: str, vouched: bool):
     """(reason, detail) for info["other_reason"] when the deep series scoring ends in Other.
     vouched = TMDB / TVmaze / Wikidata / OpenAI knew the title."""
@@ -6060,6 +6238,12 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
             return _finish("education")                # course signals and no source knows it: education, not Other
         if not ok:
             _other_note(info, *_series_other_reason(p, reason, confirmed))
+        if ok and _fansub_anime(parsed):
+            # 5f: "[Judas] Title - S01E07" / "[SubsPlease] Title - 07": a known anime-only release group = anime, not series
+            a = _anime_note(info, verdict="anime", source=(info.get("anime") or {}).get("source") or "fansub")
+            a.setdefault("notes", []).append("known anime fansub group + episode marker: anime, not series")
+            sinfo["to_anime"] = "known anime fansub group"
+            return _finish("anime")
         return _finish("series") if ok else "other"
 
     # what the movie cleaner made of the name (handlers/autosort.py logs it when the file ends in Other)
@@ -6106,6 +6290,14 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
             if status == "none" and p.get("movie"):
                 # TMDB answered "no such film": spelling variants (Chaadum / Chadum), then Wikidata
                 status, kind = await _movie_fallbacks(session, tmdb_key, p, info, anime_mode)
+            if status == "found" and kind == "movie" and _episode_marked(p):
+                # 5h: an episode-marked name ("Title - 07") is never a film that merely shares the show's title
+                logger.info("autosort ident: %r matched a TMDB film but carries an episode marker - not a movie",
+                            (p.get("clean_title") or p["titles"][0])[:60])
+                for k in ("tmdb_id", "tmdb_media", "tmdb_match"):
+                    info.pop(k, None)
+                status, kind = "none", None
+                p["is_episode"] = True
         if status == "found":
             found = (p, kind, hit)
             break
@@ -6587,6 +6779,15 @@ def _anime_score(q: str, n: str) -> float:
     return _sim(q, n)
 
 
+@_new_rule(lambda *a, **k: False)
+def _anime_prefix_hit(q: str, n: str) -> bool:
+    """ANILIST_PREFIX_MATCH: the query is the whole-word START of an AniList title, with at least two words / 8 letters
+    ("kekkon yubiwa" -> "kekkon yubiwa monogatari"). Only used for names with a known fansub group (ctx["prefix_ok"])."""
+    if not ANILIST_PREFIX_MATCH or not q or not n or len(q.replace(" ", "")) < 8 or len(q.split()) < 2:
+        return False
+    return n.startswith(q + " ") and _DIGITS.findall(q) == _DIGITS.findall(n[:len(q)])
+
+
 def _anilist_best_match_deep(results, queries, year, strict: bool, ctx: dict):
     """The deep_anime choice among AniList results -> (media | None, details dict).
 
@@ -6626,6 +6827,8 @@ def _anilist_best_match_deep(results, queries, year, strict: bool, ctx: dict):
                 seasons.add(ns)
             for q, qb in qs:
                 s = _anime_score(qb, nb)
+                if s < MIN_TITLE_SCORE and ctx.get("prefix_ok") and _anime_prefix_hit(qb, nb):
+                    s = MIN_TITLE_SCORE                   # 5e: "kekkon yubiwa" = start of "kekkon yubiwa monogatari"
                 if s > score:
                     score = s
                 if qb and qb == nb:
@@ -7093,7 +7296,8 @@ async def _anime_lookup_core(session, p: dict, anilist_key: str, use_anilist: bo
     # strict (exact title + popularity) for a name with no release signal AND for a SOFT anime candidate: naming alone
     # ("Episode 25" + "Dubbed", an episode number without a season) is never proof, an obscure same-name entry is not one
     weak = bool(p.get("weak", False)) or bool(ap.get("soft"))
-    ck = (base, year or None, weak)       # a strict "none" must not answer a fansub-tagged name (and the other way round)
+    ck = (base, year or None, weak,       # a strict "none" must not answer a fansub-tagged name (and the other way round)
+          bool(ANILIST_PREFIX_MATCH and ap.get("known_group") and ap.get("fansub")))
     hit = _ANIME_CACHE.get(ck)
     if hit is not None:
         _ANIME_CACHE.move_to_end(ck)
@@ -7102,7 +7306,8 @@ async def _anime_lookup_core(session, p: dict, anilist_key: str, use_anilist: bo
 
     ctx = {"episode": bool(ap.get("has_episode") or p.get("strong_episode") or p.get("is_episode")),
            "season": ap.get("season") or p.get("season"), "minutes": minutes,
-           "any_origin": ANILIST_ANY_ORIGIN}
+           "any_origin": ANILIST_ANY_ORIGIN,
+           "prefix_ok": bool(ANILIST_PREFIX_MATCH and ap.get("known_group") and ap.get("fansub"))}
     queries = [_norm_cmp(t) for t in titles]
     search_titles = list(titles)
     if TITLE_SPACE_VARIANTS:                                  # "House Mates" -> "Housemates" for the AniList search

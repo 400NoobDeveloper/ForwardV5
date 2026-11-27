@@ -307,6 +307,11 @@ def text_without_links(message):
 CAPTION_FROM_IDENT = os.environ.get("AUTOSORT_CAPTION_FROM_IDENT", "1").strip().lower() not in ("0", "false", "no", "off")
 CAPTION_SEASON_RANGE = os.environ.get("CAPTION_SEASON_RANGE", "1").strip().lower() not in ("0", "false", "no", "off")
 CAPTION_BARE_EPISODE = os.environ.get("CAPTION_BARE_EPISODE", "1").strip().lower() not in ("0", "false", "no", "off")
+# CAPTION_DOMAIN_STRICT=1 (default, /autosort captions only): a "site tag" is at most name.tld ("4kHdHub.Com", "www.1TamilMV.tf"); a
+# dotted title that happens to end in ".In" / ".To" ("13th.Some.Lessons.Arent.Taught.In.Classrooms") is no longer cut off. 0 = old.
+CAPTION_DOMAIN_STRICT = os.environ.get("CAPTION_DOMAIN_STRICT", "1").strip().lower() not in ("0", "false", "no", "off")
+# CAPTION_EP_VERSION=1 (default): "S01E07v2" (a fansub version suffix) is read as S01E07v2, and the caption keeps "v2". 0 = old.
+CAPTION_EP_VERSION = os.environ.get("CAPTION_EP_VERSION", "1").strip().lower() not in ("0", "false", "no", "off")
 _MEDIA_MOVIE = ("movie", "movie_files")
 _MEDIA_EPISODIC = ("series", "series_files", "anime", "anime_files")
 
@@ -333,7 +338,8 @@ _AUDIO_RE = re.compile(
 _SUB_RE = re.compile(r"(?<![A-Za-z0-9])(e-?subs?|m-?subs?|multi[ ]?subs?|hard[ ]?subs?|subbed)(?![A-Za-z0-9])", re.I)
 _DUB_RE = re.compile(r"(?<![A-Za-z0-9])(dual[ ]audio|multi[ ]audio|tri[ ]audio|dubbed)(?![A-Za-z0-9])", re.I)
 _EP_RE = re.compile(
-    r"(?<![A-Za-z0-9])S(\d{1,2})[ ]?E(\d{1,4})(?:[ ]?[-–][ ]?E?(\d{1,4})|E(\d{1,4}))?(?![A-Za-z0-9])", re.I)
+    r"(?<![A-Za-z0-9])S(\d{1,2})[ ]?E(\d{1,4})(?:[ ]?[-–][ ]?E?(\d{1,4})|E(\d{1,4}))?"
+    + (r"(v\d)?" if CAPTION_EP_VERSION else r"()") + r"(?![A-Za-z0-9])", re.I)
 _EP_X_RE = re.compile(r"(?<![A-Za-z0-9])(\d{1,2})x(\d{2,3})(?![A-Za-z0-9])", re.I)
 _EP_WORD_RE = re.compile(r"(?<![A-Za-z0-9])(?:ep|episode)[ ]?(\d{1,4})(?![A-Za-z0-9])", re.I)
 _EP_ABS_RE = re.compile(r"\s-\s(\d{1,4})(?:v\d)?(?=\s|$)")
@@ -364,11 +370,23 @@ def _dedupe(items):
     return out
 
 
+def _domain_repl(m) -> str:
+    """CAPTION_DOMAIN_STRICT: remove a site tag only when it is name.tld (www. not counted); longer dotted runs are a title."""
+    try:
+        if CAPTION_DOMAIN_STRICT:
+            body = re.sub(r"^www\.", "", m.group(0), flags=re.I)
+            if body.count(".") > 1:
+                return m.group(0)
+    except Exception:
+        pass
+    return " "
+
+
 def _spaced(text: str) -> str:
     """Release-style text -> readable text: "Blue.Eye.Samurai.S01E03.720p" -> "Blue Eye Samurai S01E03 720p".
     A dot between two digits stays ("AAC5.1", "DDP2.0", "H.265" keeps its form through _CODEC_RE)."""
     text = _CAP_EXT_RE.sub("", text) if _CAP_EXT_RE.search(text[-6:]) else text
-    text = _NAME_DOMAIN_RE.sub(" ", text)                          # site tags: 4kHdHub.Com, 1TamilMV.tf
+    text = _NAME_DOMAIN_RE.sub(_domain_repl, text)                 # site tags: 4kHdHub.Com, 1TamilMV.tf
     text = re.sub(r"(?<=\D)\.(?=\S)|(?<=\S)\.(?=\D)|_", " ", text)   # separators, but not 5.1 / 2.0
     text = re.sub(r"(?<=[A-Za-z])-(?=\d{3,4}p)", " ", text)
     return re.sub(r"\s{2,}", " ", text).strip()
@@ -395,7 +413,7 @@ def _parse_media_name(raw: str, episodic: bool):
     if ep_m:
         season, episode = int(ep_m.group(1)), int(ep_m.group(2))
         last = ep_m.group(3) or ep_m.group(4)
-        ep = f"S{season:02d}E{episode:02d}" + (f"-E{int(last):02d}" if last else "")
+        ep = f"S{season:02d}E{episode:02d}" + (f"-E{int(last):02d}" if last else "") + (ep_m.group(5) or "").lower()
         ep_pos = (ep_m.start(), ep_m.end())
     else:
         xm = _EP_X_RE.search(text)
