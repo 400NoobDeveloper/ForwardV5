@@ -312,6 +312,25 @@ CAPTION_BARE_EPISODE = os.environ.get("CAPTION_BARE_EPISODE", "1").strip().lower
 CAPTION_DOMAIN_STRICT = os.environ.get("CAPTION_DOMAIN_STRICT", "1").strip().lower() not in ("0", "false", "no", "off")
 # CAPTION_EP_VERSION=1 (default): "S01E07v2" (a fansub version suffix) is read as S01E07v2, and the caption keeps "v2". 0 = old.
 CAPTION_EP_VERSION = os.environ.get("CAPTION_EP_VERSION", "1").strip().lower() not in ("0", "false", "no", "off")
+# CAPTION_GLUED_HANDLE=1 (default): "@MovierockerzsSpider_Man_2002_..." keeps "Spider_Man_2002_..." (the handle swallowed the
+# title's first word: it ends at the last lowercase -> UPPERCASE boundary); before, the whole run was removed as one @handle.
+CAPTION_GLUED_HANDLE = os.environ.get("CAPTION_GLUED_HANDLE", "1").strip().lower() not in ("0", "false", "no", "off")
+_CAP_GLUED_RE = re.compile(r"^\s*@([A-Za-z0-9]{3,})(?=[A-Za-z0-9]*_)")
+
+
+def _unglue_handle(text: str) -> str:
+    """CAPTION_GLUED_HANDLE (used by the /autosort caption parser only). Never raises."""
+    try:
+        if not CAPTION_GLUED_HANDLE or not text:
+            return text
+        m = _CAP_GLUED_RE.match(text)
+        if not m:
+            return text
+        word = m.group(1)
+        cuts = [i for i in range(3, len(word)) if word[i - 1].islower() and word[i].isupper()]
+        return (word[cuts[-1]:] + text[m.end():]) if cuts else text
+    except Exception:
+        return text
 _MEDIA_MOVIE = ("movie", "movie_files")
 _MEDIA_EPISODIC = ("series", "series_files", "anime", "anime_files")
 
@@ -395,7 +414,7 @@ def _spaced(text: str) -> str:
 def _parse_media_name(raw: str, episodic: bool):
     """Pull name / year / season-episode / episode title / tags out of one release-style line (a caption
     line or a file name). Returns a dict, or None when no usable name is there."""
-    text = _spaced(_plain_text(raw))
+    text = _spaced(_plain_text(_unglue_handle(raw)))
     text = _CAP_LABEL_PREFIX_RE.sub("", text).strip()
     for _ in range(3):                                              # leading fansub / uploader tag: [SubsPlease]
         stripped = _LEAD_TAG_RE.sub("", text)

@@ -316,6 +316,13 @@ FANSUB_IS_ANIME = _env_on("FANSUB_IS_ANIME")                   # 5f  "[Judas] Ti
 DEEP_PROMO_CLEAN = _env_on("DEEP_PROMO_CLEAN")                 # 5g  "New Released Full ... Dubbed Movie", "720p24.0fps 2689", Arabic "الحلقة N"
 EPISODE_NEVER_MOVIE = _env_on("EPISODE_NEVER_MOVIE")           # 5h  a file name with an episode / season-pack marker is never "movie"
 
+# ---- round 6 (/autosort only). Same convention.
+EPISODE_RANGE_PACK = _env_on("EPISODE_RANGE_PACK")             # 6a  "S01E01-E20" / "EP01-05" / "Episodes 1-20" is a pack: no max-length gate
+GLUED_HANDLE_SPLIT = _env_on("GLUED_HANDLE_SPLIT")             # 6b  "@MovierockerzsSpider_Man_2002..." -> also try "Spider Man"
+FILES_ARCHIVE_ONLY = _env_on("FILES_ARCHIVE_ONLY")             # 6c  an archive MIME alone ("download", 2 KB) never makes "files"
+FANSUB_UNKNOWN_ANIME = _env_on("FANSUB_UNKNOWN_ANIME")         # 6f  "[Judas] Title - S01E07" no source knows -> anime (pattern rule), not Other
+VIDEO_TAIL_NUMBER = _env_on("VIDEO_TAIL_NUMBER")               # 6d  "Film.Name.2020.720" (no extension, quality tail) is a video name
+
 CATEGORIES = (
     "anime", "anime_files",
     "series", "series_files",
@@ -989,7 +996,12 @@ def _deep_is_video(message, filename: str, ext: str) -> bool:
         return False                                  # archives, subtitles, text / office files: the extension's verdict stands
     if videoish:
         return True
-    return bool(getattr(message, "document", None) is not None and _fake_ext(ext) and _release_signal(filename))
+    if getattr(message, "document", None) is not None and _fake_ext(ext) and _release_signal(filename):
+        return True
+    # 6d VIDEO_TAIL_NUMBER: "Film.Name.2020.720" - the last dotted piece is a resolution, the name has a year / episode marker
+    return bool(VIDEO_TAIL_NUMBER and getattr(message, "document", None) is not None and _fake_ext(ext)
+                and re.fullmatch(r"\.(?:360|480|540|576|720|1080|2160)p?", ext or "", re.IGNORECASE)
+                and (re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)", filename) or _EP_MARKER_RE.search(filename)))
 
 
 # ============================================================
@@ -1394,7 +1406,7 @@ def _deep_pre(name: str):
     Runs BEFORE the movie / series name machinery sees the name. Pure string work; never raises."""
     flags = {"broadcaster": None, "tv_source": False, "ep_of": None, "pack": False, "serial": False}
     try:
-        stem = _clean_name(_strip_release_noise(_promo_clean(name)))
+        stem = _clean_name(_strip_release_noise(_promo_clean(_glued_handle_titles(name) or name)))
         m = _VIDEO_EXT_END_RE.search(stem)
         stem, ext = (stem[:m.start()], m.group(0)) if m else (stem, "")
         bm = _BCAST_RE.match(stem)
@@ -1953,6 +1965,50 @@ def _keys_equal(a: str, b: str) -> bool:
     return len(ka) >= 3 and ka == kb
 
 
+_GLUED_HANDLE_RE = re.compile(r"^\s*@([A-Za-z0-9]{3,})(?=[A-Za-z0-9]*_)")
+
+
+@_new_rule(lambda *a, **k: None)
+def _glued_handle_titles(stem: str):
+    """GLUED_HANDLE_SPLIT: a leading @handle glued to the title ("@MovierockerzsSpider_Man_2002_1080p..." - the handle swallows
+    "Spider" because "_" is a handle character). The handle ends at the last lowercase -> UPPERCASE boundary of its first word;
+    the rest is the title ("Spider_Man_2002_1080p ..."). None = nothing glued (the old behaviour). The real title is still
+    confirmed by TMDB: this only changes which text is searched."""
+    if not GLUED_HANDLE_SPLIT or not stem:
+        return None
+    m = _GLUED_HANDLE_RE.match(stem)
+    if not m:
+        return None
+    word = m.group(1)
+    cuts = [i for i in range(3, len(word)) if word[i - 1].islower() and word[i].isupper()]
+    if not cuts:
+        return None
+    rest = word[cuts[-1]:] + stem[m.end():]
+    if len(re.findall(r"[A-Za-z]", rest.split("_")[0])) < 2:
+        return None
+    return rest
+
+
+LEAD_GROUP_STRIP = _env_on("LEAD_GROUP_STRIP")                 # 6e  a leading [Group] / (Group) tag is never part of a movie title
+_LEAD_GROUP_RE = re.compile(r"^\s*[\[(【「]\s*([^\[\]()【】「」]{1,40}?)\s*[\])】」]\s*[-–—:|~]*\s*")
+
+
+@_new_rule(lambda *a, **k: None)
+def _lead_group_tag(text: str):
+    """LEAD_GROUP_STRIP: (tag, rest) when the name STARTS with a bracketed tag and the rest still has a title of 2+ letters
+    before any year / quality tag; None otherwise. A bracketed YEAR at the start ("(2009) 2012") is left alone."""
+    if not LEAD_GROUP_STRIP or not text:
+        return None
+    m = _LEAD_GROUP_RE.match(text)
+    if not m or re.fullmatch(r"(?:19|20)\d{2}", m.group(1).strip()):
+        return None
+    rest = text[m.end():]
+    head = re.split(r"[\[(]\s*(?:19|20)\d{2}\s*[\])]|(?<![A-Za-z0-9])\d{3,4}p(?![A-Za-z0-9])", rest, maxsplit=1)[0]
+    if len(re.findall(r"[^\W_]", head)) < 2:
+        return None
+    return m.group(1).strip(), rest
+
+
 def _movie_info(raw: str) -> dict:
     """Pure clean-up of one release name for deep MOVIE identification (no network, never raises).
       title        the cut-out title ("M S M", "2012", "Kalaratri")        year   release year or None
@@ -1973,11 +2029,19 @@ def _movie_info(raw: str) -> dict:
             return out
         hm = _HANDLE_RE.search(stem)
         out["handle"] = hm.group(0) if hm else None
+        glued = _glued_handle_titles(stem)                    # 6b: "@MovierockerzsSpider_Man_2002..." -> "Spider_Man_2002..."
+        if glued:
+            stem = glued
         text = _clean_name(stem)                              # @handles, URLs, www.site tags, emoji, empty brackets
         m = _MOVIE_BRACKET_HANDLE_RE.match(text)              # "[VC_Movie] Title ..."
         if m:
             out["handle"] = out["handle"] or m.group(1)
             text = text[m.end():]
+        else:
+            lead = _lead_group_tag(text)                      # 6e: "[HDHub4u] Leo (2023)", "(Tamil) Leo", "[4K] Leo"
+            if lead:
+                out["handle"] = out["handle"] or lead[0]
+                text = lead[1]
         max_year = datetime.date.today().year + 1
         bracket_year = []
 
@@ -2132,7 +2196,26 @@ def _detect_pack(name: str, g: dict, pre: dict, prep: dict, anime_like: bool) ->
     return bool(anime_like and _BATCH_SEASONLESS_RE.search(name))
 
 
+_EP_RANGE_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:s\d{1,2}[ ._-]?e\d{1,4}[ ._]*[-–~][ ._]*(?:s\d{1,2}[ ._-]?)?e?\d{1,4}"
+    r"|(?:ep|eps|episodes?)[ ._]*\d{1,4}[ ._]*(?:-|–|~|to)[ ._]*(?:ep[ ._]*)?\d{1,4})(?![A-Za-z0-9])", re.IGNORECASE)
+
+
 @_new_rule(lambda *a, **k: False)
+def episode_range_pack(names) -> bool:
+    """EPISODE_RANGE_PACK: a multi-episode range in any name ("S01E01-E20", "S01E25-E32", "EP01-05", "Episodes 1-20") makes the
+    file a pack, so the MAXIMUM-length gate of the series / anime channels does not apply. A single episode is not a pack."""
+    if not EPISODE_RANGE_PACK:
+        return False
+    for n in names or []:
+        m = _EP_RANGE_RE.search(n or "")
+        if m:
+            nums = [int(x) for x in re.findall(r"\d+", re.sub(r"(?i)s\d{1,2}", "", m.group(0)))]
+            if len(nums) >= 2 and nums[-1] > nums[0]:
+                return True
+    return False
+
+
 def is_season_pack(parsed) -> bool:
     """True when a parsed name (the dict of _parse_name(), or a list of them) is a season pack: a season number with no
     episode number ("S01", "Season 1") or a batch word (Complete, Combined, Batch, Full Season, All Episodes). Used by
@@ -3733,8 +3816,8 @@ def _signal_recheck(message):
         return None                                   # 5c: ".ass" / ".srt" ...: the extension decides (audio/aac is a mimetypes guess)
     if ext in DEEP_AUDIO_EXTENSIONS or mime.startswith("audio/"):
         return "audio"
-    if ext in ARCHIVE_EXTENSIONS or mime in _ARCHIVE_MIMES or (name and _split_deep(name)):
-        return "files"
+    if ext in ARCHIVE_EXTENSIONS or (name and _split_deep(name)) or (mime in _ARCHIVE_MIMES and not FILES_ARCHIVE_ONLY):
+        return "files"                                # 6c: an archive MIME type alone ("download", 2 KB) is not an archive
     if ext in VIDEO_EXTENSIONS or ext in _DEEP_EXTRA_VIDEO_EXTENSIONS:
         return "video"
     if (mime.startswith("video/") or getattr(message, "video", None) is not None) and ext not in _KNOWN_EXTS:
@@ -6192,7 +6275,7 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
              "reason": "", "runtime": None, "title": first.get("clean_title") or first["titles"][0],
              "language": first.get("language"), "ambiguous": False, "to_anime": None,
              "season_pack": any(pp.get("season_pack") for pp in parsed),       # "S01 Combined": the length gate skips it
-             "pack": is_season_pack(parsed),                                   # any season pack (S01 / Season 1 / Batch ...)
+             "pack": is_season_pack(parsed) or episode_range_pack(names),     # any season pack (S01 / Season 1 / Batch / E01-E20 ...)
              "tv_source": any(pp.get("tv_source") for pp in parsed),
              "looked_series": any(pp.get("strong_episode") or pp.get("is_episode") or pp.get("series_like")
                                   or pp.get("tv_source") for pp in parsed)}
@@ -6238,7 +6321,7 @@ async def _deep_series(message, names, parsed, is_files: bool, session, tmdb_key
             return _finish("education")                # course signals and no source knows it: education, not Other
         if not ok:
             _other_note(info, *_series_other_reason(p, reason, confirmed))
-        if ok and _fansub_anime(parsed):
+        if _fansub_anime(parsed) and not (nsfw or extra) and (ok or FANSUB_UNKNOWN_ANIME):
             # 5f: "[Judas] Title - S01E07" / "[SubsPlease] Title - 07": a known anime-only release group = anime, not series
             a = _anime_note(info, verdict="anime", source=(info.get("anime") or {}).get("source") or "fansub")
             a.setdefault("notes", []).append("known anime fansub group + episode marker: anime, not series")
