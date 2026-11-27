@@ -136,6 +136,49 @@ AUTOSORT_NSFW_FIRST = os.environ.get("AUTOSORT_NSFW_FIRST", "1").strip().lower()
 # (type, season / episode, year); a disagreement is logged and the Step 1 result is used. 0 = no check, the Step 1 result is used.
 AUTOSORT_STEP2_CHECK = os.environ.get("AUTOSORT_STEP2_CHECK", "1").strip().lower() not in ("0", "false", "no", "off")
 
+# AUTOSORT_FILES_FALLBACK=1 (default): when "X_files" has no channel, the channel mapped for "X" is used (and the other way round)
+# before the file falls back to Other (movie / series / anime / education / nsfw). 0 = old behaviour (unmapped -> Other).
+AUTOSORT_FILES_FALLBACK = os.environ.get("AUTOSORT_FILES_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off")
+
+# AUTOSORT_MSG_LOG=1 (default): ONE "autosort msg" INFO line per message (id, name, classified, final, outcome, reason), the
+# per-message error isolation and the reconciliation line of the completed message. 0 = old behaviour.
+AUTOSORT_MSG_LOG = os.environ.get("AUTOSORT_MSG_LOG", "1").strip().lower() not in ("0", "false", "no", "off")
+
+_TWIN_BASES = ("movie", "series", "anime", "education", "nsfw")
+
+
+def _twin_category(category):
+    """"movie_files" <-> "movie" (series / anime / education / nsfw too); None for every other category."""
+    if not category:
+        return None
+    base = category[:-6] if category.endswith("_files") else category
+    if base not in _TWIN_BASES:
+        return None
+    return base if category.endswith("_files") else base + "_files"
+
+
+def _files_fallback(category, mapping):
+    """AUTOSORT_FILES_FALLBACK: the twin category whose channel is used when `category` has none, else None. Never raises."""
+    if not AUTOSORT_FILES_FALLBACK:
+        return None
+    try:
+        twin = _twin_category(category)
+        if twin and mapping.get(category) is None and mapping.get(twin) is not None:
+            return twin
+    except Exception as e:
+        logger.warning("autosort: files fallback rule failed for %s (%s) - old behaviour", category, e)
+    return None
+
+
+def _fallback_lines(mapping):
+    """The "Fallbacks" lines of the /autosort confirmation message: which unmapped category uses which channel."""
+    out = []
+    for cat in CATEGORIES:
+        twin = _files_fallback(cat, mapping)
+        if twin:
+            out.append(f"{CATEGORY_LABELS.get(cat, cat)} → uses {CATEGORY_LABELS.get(twin, twin)}")
+    return out
+
 
 def _new_run_id() -> str:
     global _next_id
@@ -292,11 +335,15 @@ async def autosort_cmd(bot: Client, message):
     mapping_lines = "\n".join(
         f"{CATEGORY_LABELS.get(cat, cat)} → `{chat_id_}`" for cat, chat_id_ in mapping.items()
     )
-    unmapped = [c for c in CATEGORIES if c not in mapping]
+    fb_lines = _fallback_lines(mapping)
+    fb_cats = {c for c in CATEGORIES if _files_fallback(c, mapping)}
+    unmapped = [c for c in CATEGORIES if c not in mapping and c not in fb_cats]
     unmapped_note = (
         f"\n\n<i>Not configured (will go to Other): {', '.join(unmapped)}</i>"
         if unmapped else ""
     )
+    if fb_lines:
+        unmapped_note += "\n\n<b>Fallbacks (AUTOSORT_FILES_FALLBACK):</b>\n" + "\n".join(fb_lines)
 
     dup_note = (
         "Duplicates go to the Duplicate channel."
@@ -502,9 +549,26 @@ def _progress_text(stats: dict, mapping: dict, pacing: dict, total_files: int, s
         f"{fetched}/{total_files}", stats["forwarded"], stats["duplicate"], stats["errors"],
         stats["filtered"], status, "{:.1f}".format(pct), _format_duration(eta), progress,
     )
+    if status in ("completed", "cancelled"):
+        text = _with_reconcile(text, stats)
     if status == "completed":
         text = _with_sources(_with_other_because(text, stats), stats)
     return text
+
+
+def _with_reconcile(text: str, stats: dict) -> str:
+    """AUTOSORT_MSG_LOG: "fetched N = forwarded + filtered + duplicate + skipped + errors" (+ empty / service counted apart)."""
+    if not AUTOSORT_MSG_LOG:
+        return text
+    f, fw, fl, du = stats["fetched"], stats["forwarded"], stats["filtered"], stats["duplicate"]
+    sk, er, em = stats.get("skipped", 0), stats["errors"], stats.get("empty", 0)
+    total = fw + fl + du + sk + er + em
+    line = (f"\n\n<b>Check:</b> fetched {f} = forwarded {fw} + filtered {fl} + duplicate {du} + skipped {sk} + errors {er}"
+            f" + empty/service {em}" + (" ✅" if total == f else f" ⚠️ (sum {total})"))
+    fb = stats.get("files_fallback") or 0
+    if fb:
+        line += f"\n<b>Files fallback used:</b> {fb}"
+    return text + line if len(text) + len(line) <= 4096 else text
 
 
 def _with_other_because(text: str, stats: dict) -> str:
@@ -1144,6 +1208,19 @@ def _edited_caption(message, classified, info, remove_links):
     return caption, classified
 
 
+def _msg_log(message, classified, final, outcome, reason):
+    """AUTOSORT_MSG_LOG: ONE INFO line per message of the range - its single outcome
+    (forwarded | filtered | duplicate | skipped | error | empty). Never raises."""
+    if not AUTOSORT_MSG_LOG:
+        return
+    try:
+        logger.info("autosort msg: id=%s name=%r class=%s final=%s outcome=%s reason=%s",
+                    getattr(message, "id", "-"), _movie_label(message), classified or "-", final or "-", outcome,
+                    (str(reason) if reason else "-")[:200])
+    except Exception:
+        pass
+
+
 def _log_other_route(message, classified, final, why, detail):
     """ONE INFO line per file that ended in Other: what it was, what the classifier said, why."""
     logger.info("autosort other-route: msg=%s name=%r class=%s final=%s reason=%s detail=%s",
@@ -1155,7 +1232,7 @@ async def _run(client, user_id, m, cfg):
     from_chat = cfg["from_chat"]
     stats = {"fetched": 0, "forwarded": 0, "unsorted": 0, "errors": 0, "filtered": 0, "fallback": 0, "duplicate": 0,
              "ratio_other": 0, UNIDENTIFIED: 0, TMDB_UNAVAILABLE: 0, "other_why": {}, "calls": {}, "hits": {},
-             "anilist_on": False, "start": time.time()}
+             "anilist_on": False, "start": time.time(), "empty": 0, "skipped": 0, "files_fallback": 0}
     for category in mapping:
         stats[category] = 0
 
@@ -1214,157 +1291,185 @@ async def _run(client, user_id, m, cfg):
             pling += 1
             stats["fetched"] += 1
 
-            if message.empty or message.service:
-                stats["errors"] += 1
-                continue
-
-            allowed, reason = check_filters(message, configs, disabled_types, seen_file_ids)
-            if not allowed:
-                if reason == "duplicate" and dup_dest is not None:
-                    # Duplicate channel is set -> forward the repeat there
-                    # instead of skipping it.
-                    ok = await _copy_with_retry(
-                        client, dup_dest, from_chat, message.id, m, stats, mapping, pacing, total_files,
-                        caption=autosort_caption(message, None, remove_links),
-                    )
-                    if not ok:
-                        ok = await _copy_with_retry(
-                            client, dup_dest, from_chat, message.id, m, stats, mapping, pacing, total_files,
-                            forward=True,
-                        )
-                    if ok:
-                        stats["duplicate"] += 1
-                        pacing["streak"] += 1
-                        if pacing["streak"] % EASE_DOWN_EVERY == 0 and pacing["delay"] > pacing["min"]:
-                            pacing["delay"] = max(pacing["min"], pacing["delay"] * EASE_DOWN_FACTOR)
+            try:
+                if message.empty or message.service:
+                    if AUTOSORT_MSG_LOG:
+                        stats["empty"] = stats.get("empty", 0) + 1     # counted apart, not an error
+                        _msg_log(message, "-", "-", "empty", "empty or service message")
                     else:
                         stats["errors"] += 1
-                    await asyncio.sleep(pacing["delay"])
-                    continue
-                stats[reason] = stats.get(reason, 0) + 1
-                continue
-
-            new_text = None
-            if remove_links and message.text:
-                new_text = text_without_links(message)
-                if new_text == "":
-                    # a message that was nothing but links: nothing left to forward
-                    stats["filtered"] = stats.get("filtered", 0) + 1
                     continue
 
-            skipped = None
-            nsfw_hit = _nsfw_first(message)
-            if nsfw_hit:
-                # 0) NSFW keywords: decided here, before any TMDB / AniList call. The NSFW channel when one is mapped, else Other.
-                info = {}
-                category = nsfw_category(message, mapping) or "other"
-                if category == "other":
-                    info = {"other_reason": "nsfw_unmapped",
-                            "other_detail": "adult-content keywords in the name / caption, no NSFW channel is mapped"}
-            else:
-                # classify_async (deep_series / deep_anime, /autosort only), asked again when TMDB failed
-                category, info, _retries = await _classify_with_retry(
-                    message, tmdb_session, tmdb_key, use_anilist, anilist_key)
-                if category in SKIP_CATEGORIES:
-                    # TMDB unreachable (after the retries) -> don't drop it, put it in Other.
-                    stats[category] += 1
-                    skipped = category
-                    category = "other"
-            classified = category
-            _count_hit(stats, classified, info)
-            # Step 1 (caption from the identification record) + Step 2 (category from the edited caption). Done before the
-            # gates; a failure here falls back to today's caption and the classifier's category.
-            cap_class = "nsfw" if nsfw_hit else classified          # an adult file never gets a rebuilt caption (not even the "other" one)
-            try:
-                caption, classified = _edited_caption(message, cap_class, info, remove_links)
+                allowed, reason = check_filters(message, configs, disabled_types, seen_file_ids)
+                if not allowed:
+                    if reason == "duplicate" and dup_dest is not None:
+                        # Duplicate channel is set -> forward the repeat there
+                        # instead of skipping it.
+                        ok = await _copy_with_retry(
+                            client, dup_dest, from_chat, message.id, m, stats, mapping, pacing, total_files,
+                            caption=autosort_caption(message, None, remove_links),
+                        )
+                        if not ok:
+                            ok = await _copy_with_retry(
+                                client, dup_dest, from_chat, message.id, m, stats, mapping, pacing, total_files,
+                                forward=True,
+                            )
+                        _msg_log(message, "duplicate", "duplicate" if ok else "-", "duplicate" if ok else "error",
+                                 "same file seen earlier in this run" if ok else "copy to the Duplicate channel failed")
+                        if ok:
+                            stats["duplicate"] += 1
+                            pacing["streak"] += 1
+                            if pacing["streak"] % EASE_DOWN_EVERY == 0 and pacing["delay"] > pacing["min"]:
+                                pacing["delay"] = max(pacing["min"], pacing["delay"] * EASE_DOWN_FACTOR)
+                        else:
+                            stats["errors"] += 1
+                        await asyncio.sleep(pacing["delay"])
+                        continue
+                    stats[reason] = stats.get(reason, 0) + 1
+                    _msg_log(message, "-", "-", reason, "/settings filters" if reason == "filtered" else "same file seen earlier")
+                    continue
+
+                new_text = None
+                if remove_links and message.text:
+                    new_text = text_without_links(message)
+                    if new_text == "":
+                        # a message that was nothing but links: nothing left to forward
+                        stats["filtered"] = stats.get("filtered", 0) + 1
+                        _msg_log(message, "text", "-", "filtered", "text was only links")
+                        continue
+
+                skipped = None
+                nsfw_hit = _nsfw_first(message)
                 if nsfw_hit:
-                    classified = category
-            except Exception as e:
-                logger.warning("autosort: caption step failed for msg %s (%s: %s) - today's caption", message.id, type(e).__name__, e)
-                caption = autosort_caption(message, cap_class, remove_links)
-                if nsfw_hit:
-                    classified = category
-            # Movie channel gate (duration / thumbnail ratio / TMDB runtime). Done
-            # here, not in classify_async(), which /fwd shares. A file that fails
-            # is not dropped, filtered or counted as an error: it goes to Other.
-            gate = sgate = agate = egate = None
-            if classified in MOVIE_GATE_CATEGORIES:
-                gate = await _movie_gate(message, classified, info, tmdb_session, tmdb_key)
-                category = gate["category"]
-            elif classified in SERIES_GATE_CATEGORIES:
-                # Same idea for the Series channel: episode length + landscape thumbnail.
-                sgate = _series_gate(message, classified, info)
-                category = sgate["category"]
-            elif classified in ANIME_GATE_CATEGORIES:
-                # ... and for the Anime channel: a thumbnail, a normal length, a landscape thumbnail.
-                agate = _anime_gate(message, classified, info)
-                category = agate["category"]
-            elif classified in EDUCATION_GATE_CATEGORIES:
-                # ... and for the Education VIDEO channel: a thumbnail of a landscape shape (no length rule).
+                    # 0) NSFW keywords: decided here, before any TMDB / AniList call. The NSFW channel when one is mapped, else Other.
+                    info = {}
+                    category = nsfw_category(message, mapping) or "other"
+                    if category == "other":
+                        info = {"other_reason": "nsfw_unmapped",
+                                "other_detail": "adult-content keywords in the name / caption, no NSFW channel is mapped"}
+                else:
+                    # classify_async (deep_series / deep_anime, /autosort only), asked again when TMDB failed
+                    category, info, _retries = await _classify_with_retry(
+                        message, tmdb_session, tmdb_key, use_anilist, anilist_key)
+                    if category in SKIP_CATEGORIES:
+                        # TMDB unreachable (after the retries) -> don't drop it, put it in Other.
+                        stats[category] += 1
+                        skipped = category
+                        category = "other"
+                classified = category
+                _count_hit(stats, classified, info)
+                # Step 1 (caption from the identification record) + Step 2 (category from the edited caption). Done before the
+                # gates; a failure here falls back to today's caption and the classifier's category.
+                cap_class = "nsfw" if nsfw_hit else classified          # an adult file never gets a rebuilt caption (not even the "other" one)
                 try:
-                    egate = _education_gate(message, classified, info)
-                    category = egate["category"]
-                except Exception as e:                    # new rule: one warning, the old behaviour for this file
-                    logger.warning("autosort: education thumbnail rule failed for msg %s (%s) - not gated", message.id, e)
-                    egate = None
-            gated = category
-            dest = mapping.get(category)
-            if dest is None:
-                # No channel mapped for this category -> Other.
-                stats["unsorted"] += 1
-                category = "other"
-                dest = other_dest
-            why = detail = None
-            if category == "other":
-                why, detail = _other_why(skipped, classified, gated, category, gate or sgate or agate or egate, info)
-            if gate is not None or (info.get("tmdb_media") == "movie" and classified.startswith("anime")):
-                _log_movie_route(message, classified, gated, category, gate, info)
-            if sgate is not None or (info.get("series") or {}).get("candidate"):
-                _log_series_route(message, classified, gated, category, sgate, info)
-            if classified.startswith("anime") and (info.get("series") or {}).get("to_anime"):
-                _log_series_to_anime(message, classified, category, info)
-            if classified.startswith("anime") or (info.get("anime") or {}).get("downgraded"):
-                _log_anime_route(message, classified, gated, category, agate or sgate or gate, info)
-            if egate is not None:
-                _log_education_route(message, classified, gated, category, egate, info)
-
-            # Caption: movie / series / anime (+ "_files") get a rebuilt caption (name, year or season-episode,
-            # quality ...); every other category keeps its caption, only the links are removed. Decided by the
-            # classifier's category, so a real movie a gate sent to Other is still captioned. None = leave as is.
-            ok = await _copy_with_retry(
-                client, dest, from_chat, message.id, m, stats, mapping, pacing, total_files,
-                caption=caption, text=new_text,
-            )
-            if not ok and new_text is None:
-                # Unsupported by copy_message -> plain-forward it to Other.
-                ok = await _copy_with_retry(
-                    client, other_dest, from_chat, message.id, m, stats, mapping, pacing, total_files,
-                    forward=True,
-                )
-                if ok:
-                    stats["fallback"] += 1
+                    caption, classified = _edited_caption(message, cap_class, info, remove_links)
+                    if nsfw_hit:
+                        classified = category
+                except Exception as e:
+                    logger.warning("autosort: caption step failed for msg %s (%s: %s) - today's caption", message.id, type(e).__name__, e)
+                    caption = autosort_caption(message, cap_class, remove_links)
+                    if nsfw_hit:
+                        classified = category
+                # Movie channel gate (duration / thumbnail ratio / TMDB runtime). Done
+                # here, not in classify_async(), which /fwd shares. A file that fails
+                # is not dropped, filtered or counted as an error: it goes to Other.
+                gate = sgate = agate = egate = None
+                if classified in MOVIE_GATE_CATEGORIES:
+                    gate = await _movie_gate(message, classified, info, tmdb_session, tmdb_key)
+                    category = gate["category"]
+                elif classified in SERIES_GATE_CATEGORIES:
+                    # Same idea for the Series channel: episode length + landscape thumbnail.
+                    sgate = _series_gate(message, classified, info)
+                    category = sgate["category"]
+                elif classified in ANIME_GATE_CATEGORIES:
+                    # ... and for the Anime channel: a thumbnail, a normal length, a landscape thumbnail.
+                    agate = _anime_gate(message, classified, info)
+                    category = agate["category"]
+                elif classified in EDUCATION_GATE_CATEGORIES:
+                    # ... and for the Education VIDEO channel: a thumbnail of a landscape shape (no length rule).
+                    try:
+                        egate = _education_gate(message, classified, info)
+                        category = egate["category"]
+                    except Exception as e:                    # new rule: one warning, the old behaviour for this file
+                        logger.warning("autosort: education thumbnail rule failed for msg %s (%s) - not gated", message.id, e)
+                        egate = None
+                gated = category
+                dest = mapping.get(category)
+                twin = _files_fallback(category, mapping) if dest is None else None
+                if twin:
+                    # AUTOSORT_FILES_FALLBACK: "movie_files" has no channel -> the Movie channel (and the other way round)
+                    stats["files_fallback"] = stats.get("files_fallback", 0) + 1
+                    logger.info("autosort files-fallback: msg=%s name=%r %s has no channel -> %s",
+                                message.id, _movie_label(message), category, twin)
+                    category = gated = twin
+                    dest = mapping[twin]
+                if dest is None:
+                    # No channel mapped for this category -> Other.
+                    stats["unsorted"] += 1
                     category = "other"
-                    why, detail = "other_type", "copy_message failed, forwarded to Other"
-            if ok:
-                stats["forwarded"] += 1
-                stats[category] = stats.get(category, 0) + 1     # FINAL category ("other" for a gated movie / series / anime)
+                    dest = other_dest
+                why = detail = None
                 if category == "other":
-                    why = why or "unidentified"
-                    stats["other_why"][why] = stats["other_why"].get(why, 0) + 1
-                    _log_other_route(message, classified, category, why, detail)
-                if ((gate is not None and gate["ratio_hit"]) or (sgate is not None and sgate["ratio_hit"])
-                        or (agate is not None and agate["ratio_hit"]) or (egate is not None and egate["ratio_hit"])):
-                    stats["ratio_other"] += 1
-                # Clean run for a while -> ease the pace back down toward the
-                # baseline instead of staying at whatever a past FloodWait
-                # pushed it to forever.
-                pacing["streak"] += 1
-                if pacing["streak"] % EASE_DOWN_EVERY == 0 and pacing["delay"] > pacing["min"]:
-                    pacing["delay"] = max(pacing["min"], pacing["delay"] * EASE_DOWN_FACTOR)
-            else:
-                stats["errors"] += 1
+                    why, detail = _other_why(skipped, classified, gated, category, gate or sgate or agate or egate, info)
+                if gate is not None or (info.get("tmdb_media") == "movie" and classified.startswith("anime")):
+                    _log_movie_route(message, classified, gated, category, gate, info)
+                if sgate is not None or (info.get("series") or {}).get("candidate"):
+                    _log_series_route(message, classified, gated, category, sgate, info)
+                if classified.startswith("anime") and (info.get("series") or {}).get("to_anime"):
+                    _log_series_to_anime(message, classified, category, info)
+                if classified.startswith("anime") or (info.get("anime") or {}).get("downgraded"):
+                    _log_anime_route(message, classified, gated, category, agate or sgate or gate, info)
+                if egate is not None:
+                    _log_education_route(message, classified, gated, category, egate, info)
 
-            await asyncio.sleep(pacing["delay"])
+                # Caption: movie / series / anime (+ "_files") get a rebuilt caption (name, year or season-episode,
+                # quality ...); every other category keeps its caption, only the links are removed. Decided by the
+                # classifier's category, so a real movie a gate sent to Other is still captioned. None = leave as is.
+                ok = await _copy_with_retry(
+                    client, dest, from_chat, message.id, m, stats, mapping, pacing, total_files,
+                    caption=caption, text=new_text,
+                )
+                if not ok and new_text is None:
+                    # Unsupported by copy_message -> plain-forward it to Other.
+                    ok = await _copy_with_retry(
+                        client, other_dest, from_chat, message.id, m, stats, mapping, pacing, total_files,
+                        forward=True,
+                    )
+                    if ok:
+                        stats["fallback"] += 1
+                        category = "other"
+                        why, detail = "other_type", "copy_message failed, forwarded to Other"
+                if ok:
+                    stats["forwarded"] += 1
+                    stats[category] = stats.get(category, 0) + 1     # FINAL category ("other" for a gated movie / series / anime)
+                    if category == "other":
+                        why = why or "unidentified"
+                        stats["other_why"][why] = stats["other_why"].get(why, 0) + 1
+                        _log_other_route(message, classified, category, why, detail)
+                    _msg_log(message, classified, category, "forwarded", why or ("files fallback" if twin else "-"))
+                    if ((gate is not None and gate["ratio_hit"]) or (sgate is not None and sgate["ratio_hit"])
+                            or (agate is not None and agate["ratio_hit"]) or (egate is not None and egate["ratio_hit"])):
+                        stats["ratio_other"] += 1
+                    # Clean run for a while -> ease the pace back down toward the
+                    # baseline instead of staying at whatever a past FloodWait
+                    # pushed it to forever.
+                    pacing["streak"] += 1
+                    if pacing["streak"] % EASE_DOWN_EVERY == 0 and pacing["delay"] > pacing["min"]:
+                        pacing["delay"] = max(pacing["min"], pacing["delay"] * EASE_DOWN_FACTOR)
+                else:
+                    stats["errors"] += 1
+                    _msg_log(message, classified, category, "error", "copy and forward both failed")
+
+                await asyncio.sleep(pacing["delay"])
+            except Exception as e:
+                # AUTOSORT_MSG_LOG: one failed message (TMDB / caption / copy) never stops the run or skips the next ones
+                if not AUTOSORT_MSG_LOG:
+                    raise
+                stats["errors"] += 1
+                logger.warning("autosort: msg %s failed (%s: %s) - counted as error, run continues",
+                               getattr(message, "id", "-"), type(e).__name__, e)
+                _msg_log(message, "-", "-", "error", f"{type(e).__name__}: {e}")
+                await asyncio.sleep(pacing["delay"])
         else:
             await _safe_edit(m, _progress_text(stats, mapping, pacing, total_files, "completed"), _status_markup("completed"))
             await _notify(client, user_id, "Forwarding Completed", mapping)
